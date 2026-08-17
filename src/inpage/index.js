@@ -2,8 +2,8 @@
 // window.ethereum. It has no chrome.* access - everything goes through
 // window.postMessage to the content script bridge.
 
-const TO_BRIDGE = 'miniwallet:to-bridge';
-const TO_PAGE = 'miniwallet:to-page';
+const TO_BRIDGE = 'adrix:to-bridge';
+const TO_PAGE = 'adrix:to-page';
 
 // Some older dApps gate their connect button on `ethereum.isMetaMask`.
 // Flip this to true only if you are testing against such an app.
@@ -26,9 +26,9 @@ function send(method, params) {
   });
 }
 
-class MiniWalletProvider {
+class ADRIXProvider {
   constructor() {
-    this.isMiniWallet = true;
+    this.isADRIX = true;
     this.isMetaMask = PRETEND_TO_BE_METAMASK;
     this.selectedAddress = null;
     this.chainId = null;
@@ -36,7 +36,7 @@ class MiniWalletProvider {
     this._listeners = new Map();
     this._connected = false;
     this._metamask = {
-      isUnlocked: () => send('miniwallet_isUnlocked', []),
+      isUnlocked: () => send('adrix_isUnlocked', []),
     };
   }
 
@@ -89,7 +89,7 @@ class MiniWalletProvider {
       // `disconnect` event, and dApps rely on it to clear their UI.
       if (!payload?.length && this._connected) {
         this._connected = false;
-        this._emit('disconnect', Object.assign(new Error('Disconnected from MiniWallet.'), { code: 4900 }));
+        this._emit('disconnect', Object.assign(new Error('Disconnected from ADRIX.'), { code: 4900 }));
       }
     }
     if (event === 'chainChanged') {
@@ -100,7 +100,7 @@ class MiniWalletProvider {
       try {
         handler(payload);
       } catch (err) {
-        console.error('[MiniWallet] listener threw', err);
+        console.error('[ADRIX] listener threw', err);
       }
     }
   }
@@ -129,7 +129,7 @@ class MiniWalletProvider {
   }
 }
 
-const provider = new MiniWalletProvider();
+const provider = new ADRIXProvider();
 
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
@@ -163,17 +163,17 @@ try {
   });
 } catch {
   // Another wallet locked the property down. EIP-6963 below still works.
-  console.warn('[MiniWallet] window.ethereum is already taken by another wallet.');
+  console.warn('[ADRIX] window.ethereum is already taken by another wallet.');
 }
-window.miniWallet = provider;
+window.adrix = provider;
 
 // EIP-6963 - how wagmi / RainbowKit / ConnectKit discover wallets without
 // fighting over window.ethereum.
 const providerInfo = Object.freeze({
   uuid: crypto.randomUUID(),
-  name: 'MiniWallet',
+  name: 'ADRIX',
   icon: ICON,
-  rdns: 'dev.miniwallet.extension',
+  rdns: 'dev.adrix.extension',
 });
 
 function announce() {

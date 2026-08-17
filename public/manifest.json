@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "MiniWallet",
+  "name": "ADRIX",
   "version": "0.2.0",
   "description": "An EVM wallet extension: HD accounts, tokens, network management, and an EIP-1193 provider for dApps.",
   "action": {
     "default_popup": "index.html",
-    "default_title": "MiniWallet"
+    "default_title": "ADRIX"
   },
   "background": {
     "service_worker": "background.js"

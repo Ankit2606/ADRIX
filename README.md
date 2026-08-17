@@ -1,9 +1,9 @@
-# MiniWallet 0.2
+# ADRIX 0.2
 
 An EVM wallet browser extension built with React + Vite on Manifest V3. It covers the core
 of what MetaMask does day to day: an HD keyring with multiple accounts, token and network
 management, gas control, transaction history, and a full EIP-1193 provider that any dApp can
-connect to without knowing MiniWallet exists.
+connect to without knowing ADRIX exists.
 
 **Use testnet keys only.** See "What this is not" at the bottom.
 

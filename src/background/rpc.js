@@ -26,11 +26,11 @@ async function openWallet() {
 async function requireUnlockedAccount(origin, address) {
   if (!(await hasVault())) {
     openWallet();
-    fail(4100, 'No wallet set up yet. Create one in MiniWallet, then try again.');
+    fail(4100, 'No wallet set up yet. Create one in ADRIX, then try again.');
   }
   await permissions.ensureNetworkPermitted(origin);
   const accounts = await permissions.accountsFor(origin, { requireNetwork: true });
-  if (!accounts.length) fail(4100, 'Connect to MiniWallet first.');
+  if (!accounts.length) fail(4100, 'Connect to ADRIX first.');
 
   const target = address ? getAddress(address) : accounts[0];
   if (!accounts.some((a) => a.toLowerCase() === target.toLowerCase())) {
@@ -69,9 +69,9 @@ export async function handleRpc(method, params = [], origin) {
       return String(parseInt(chainId, 16));
 
     case 'web3_clientVersion':
-      return 'MiniWallet/v0.2.0';
+      return 'ADRIX/v0.2.0';
 
-    case 'miniwallet_isUnlocked':
+    case 'adrix_isUnlocked':
       return isUnlocked();
 
     case 'eth_accounts':
@@ -92,7 +92,7 @@ export async function handleRpc(method, params = [], origin) {
 
       if (!(await hasVault())) {
         openWallet();
-        fail(4100, 'No wallet set up yet. Create one in MiniWallet, then click Connect again.');
+        fail(4100, 'No wallet set up yet. Create one in ADRIX, then click Connect again.');
       }
 
       const networks = await allNetworks();
@@ -246,7 +246,7 @@ export async function handleRpc(method, params = [], origin) {
       const target = params?.[0]?.chainId?.toLowerCase();
       const networks = await allNetworks();
       if (!networks[target]) {
-        fail(4902, 'MiniWallet does not have that network. Add it first with wallet_addEthereumChain.');
+        fail(4902, 'ADRIX does not have that network. Add it first with wallet_addEthereumChain.');
       }
       if (target === chainId) return null;
 

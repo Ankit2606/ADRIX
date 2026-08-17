@@ -78,7 +78,7 @@ export default function Onboarding({ onDone }) {
             Copy to clipboard
           </button>
           <div className="notice">
-            MiniWallet cannot recover this for you. There is no reset link and no support desk.
+            ADRIX cannot recover this for you. There is no reset link and no support desk.
           </div>
           <div className="card">
             <h2>Confirm your phrase</h2>
@@ -122,7 +122,7 @@ export default function Onboarding({ onDone }) {
       <div className="scroll pad stack">
         <div className="inline">
           <span className="dot" />
-          <b>MiniWallet</b>
+          <b>ADRIX</b>
         </div>
         <div className="eyebrow">Step 1 of 2</div>
         <h1>Set up your wallet</h1>
@@ -168,7 +168,7 @@ export default function Onboarding({ onDone }) {
               <input value={accountName} onChange={(e) => setAccountName(e.target.value)} />
             </label>
             <div className="notice">
-              A private-key import has no recovery phrase in MiniWallet. Back up that private key separately.
+              A private-key import has no recovery phrase in ADRIX. Back up that private key separately.
             </div>
           </>
         )}

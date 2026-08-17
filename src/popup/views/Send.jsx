@@ -47,7 +47,7 @@ export default function Send({ state, go }) {
       return;
     }
     if (!recipient.trim()) {
-      setError('Enter a recipient first so MiniWallet can estimate gas.');
+      setError('Enter a recipient first so ADRIX can estimate gas.');
       return;
     }
 
@@ -340,7 +340,7 @@ export default function Send({ state, go }) {
         <BackBar title="Send" onBack={() => setStep('form')} />
         <div className="scroll pad stack">
           {selectedAccount?.type === 'watch' && (
-            <div className="notice">This is a watch-only account. MiniWallet can show balances, but it cannot sign transactions.</div>
+            <div className="notice">This is a watch-only account. ADRIX can show balances, but it cannot sign transactions.</div>
           )}
           <label className="field">
             <span>Asset</span>

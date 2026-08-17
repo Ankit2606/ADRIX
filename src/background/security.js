@@ -1,6 +1,6 @@
 const SCAM_DOMAINS = [
   'evil-phishing.com',
-  'fake-miniwallet.io',
+  'fake-adrix.io',
   'scam-mint.org',
   'claim-airdrop-now.xyz'
 ];

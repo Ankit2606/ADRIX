@@ -21,7 +21,7 @@ for (const entry of entries) {
       lib: {
         entry: entry.input,
         formats: ['iife'],
-        name: `miniwallet_${entry.name}`,
+        name: `adrix_${entry.name}`,
         fileName: () => `${entry.name}.js`,
       },
       rollupOptions: {

@@ -1,8 +1,8 @@
 // Runs in the isolated world. Its only job is to relay messages between the
 // injected provider (page context) and the service worker.
 
-const TO_BRIDGE = 'miniwallet:to-bridge';
-const TO_PAGE = 'miniwallet:to-page';
+const TO_BRIDGE = 'adrix:to-bridge';
+const TO_PAGE = 'adrix:to-page';
 
 function replyToPage(payload) {
   window.postMessage({ target: TO_PAGE, payload }, window.location.origin);
@@ -23,7 +23,7 @@ window.addEventListener('message', async (event) => {
     // Usually means the extension was reloaded mid-session.
     replyToPage({
       id,
-      error: { code: 4900, message: 'MiniWallet is unavailable. Reload the page and try again.' },
+      error: { code: 4900, message: 'ADRIX is unavailable. Reload the page and try again.' },
     });
   }
 });

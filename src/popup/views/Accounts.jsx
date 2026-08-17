@@ -326,7 +326,7 @@ function ManageAccount({ account, onClose, refresh }) {
 
       {account.type === 'watch' ? (
         <div className="stack-sm">
-          <div className="notice">This is a watch-only account. MiniWallet does not have its private key.</div>
+          <div className="notice">This is a watch-only account. ADRIX does not have its private key.</div>
           <button
             className="danger"
             onClick={async () => {

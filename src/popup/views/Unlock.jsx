@@ -26,7 +26,7 @@ export default function Unlock({ onDone, compact = false }) {
         <div className="spacer" />
         <div className="inline">
           <span className="dot" />
-          <b>MiniWallet</b>
+          <b>ADRIX</b>
         </div>
         <h1>Welcome back</h1>
         {compact && <p>A site is waiting on your answer.</p>}

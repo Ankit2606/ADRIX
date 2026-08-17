@@ -139,7 +139,7 @@ export default function Approval() {
       <div className="scroll pad stack">
         <div className="inline">
           <span className="dot" />
-          <b>MiniWallet</b>
+          <b>ADRIX</b>
           {request.queued?.length > 1 && (
             <span className="badge" style={{ marginLeft: 'auto' }}>
               {request.queued.length} pending
@@ -212,7 +212,7 @@ function Shell({ children }) {
       <div className="scroll pad stack">
         <div className="inline">
           <span className="dot" />
-          <b>MiniWallet</b>
+          <b>ADRIX</b>
         </div>
         {children}
       </div>

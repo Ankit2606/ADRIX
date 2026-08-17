@@ -32,7 +32,7 @@ export default function Settings({ state, go, refresh }) {
 
           {!state.hasRecoveryPhrase && (
             <p className="small">
-              This wallet was imported from a private key, so MiniWallet does not have a recovery phrase to reveal.
+              This wallet was imported from a private key, so ADRIX does not have a recovery phrase to reveal.
             </p>
           )}
 
@@ -248,7 +248,7 @@ export default function Settings({ state, go, refresh }) {
         </section>
 
         <div className="center small" style={{ color: 'var(--faint)' }}>
-          MiniWallet 0.2.0 · testnet use only
+          ADRIX 0.2.0 · testnet use only
         </div>
       </div>
 

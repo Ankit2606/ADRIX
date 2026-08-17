@@ -19,7 +19,7 @@ export const hasRecoveryPhrase = () => session.get('secrets').then((secrets) => 
 
 async function requireSecrets() {
   const secrets = await session.get('secrets');
-  if (!secrets) throw Object.assign(new Error('MiniWallet is locked.'), { code: 4100 });
+  if (!secrets) throw Object.assign(new Error('ADRIX is locked.'), { code: 4100 });
   return secrets;
 }
 
