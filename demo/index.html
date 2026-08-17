@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MiniWallet test dApp</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #0b1020;
+        color: #e6ecfa;
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        margin: 0;
+      }
+      main {
+        width: min(560px, 90vw);
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      h1 {
+        letter-spacing: -0.02em;
+      }
+      button {
+        background: #2dd4bf;
+        color: #05231f;
+        border: 0;
+        border-radius: 9px;
+        padding: 12px 16px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.ghost {
+        background: transparent;
+        border: 1px solid #26314f;
+        color: #e6ecfa;
+      }
+      pre {
+        background: #131a2e;
+        border: 1px solid #26314f;
+        border-radius: 10px;
+        padding: 12px;
+        font-size: 12px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>MiniWallet test dApp</h1>
+      <p id="status">Not connected.</p>
+      <div class="row">
+        <button id="connect">Connect wallet</button>
+        <button class="ghost" id="sign">Sign message</button>
+        <button class="ghost" id="send">Send 0.001</button>
+      </div>
+      <pre id="log">Serve this over http:// - content scripts do not run on file:// pages.</pre>
+    </main>
+
+    <script>
+      const log = (...args) => {
+        document.getElementById('log').textContent =
+          args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))).join('\n') +
+          '\n\n' +
+          document.getElementById('log').textContent;
+      };
+
+      let account = null;
+
+      const provider = () => {
+        if (!window.ethereum) throw new Error('No wallet found. Is MiniWallet loaded and the page reloaded?');
+        return window.ethereum;
+      };
+
+      document.getElementById('connect').onclick = async () => {
+        try {
+          const accounts = await provider().request({ method: 'eth_requestAccounts' });
+          const chainId = await provider().request({ method: 'eth_chainId' });
+          account = accounts[0];
+          document.getElementById('status').textContent = `Connected: ${account} on chain ${chainId}`;
+          log('eth_requestAccounts', accounts);
+        } catch (err) {
+          log('Error ' + (err.code ?? '') + ': ' + err.message);
+        }
+      };
+
+      document.getElementById('sign').onclick = async () => {
+        try {
+          const signature = await provider().request({
+            method: 'personal_sign',
+            params: ['Hello from the test dApp at ' + new Date().toISOString(), account],
+          });
+          log('personal_sign', signature);
+        } catch (err) {
+          log('Error ' + (err.code ?? '') + ': ' + err.message);
+        }
+      };
+
+      document.getElementById('send').onclick = async () => {
+        try {
+          const hash = await provider().request({
+            method: 'eth_sendTransaction',
+            params: [{ from: account, to: account, value: '0x38D7EA4C68000' }],
+          });
+          log('eth_sendTransaction', hash);
+        } catch (err) {
+          log('Error ' + (err.code ?? '') + ': ' + err.message);
+        }
+      };
+
+      window.addEventListener('load', () => {
+        if (window.ethereum) {
+          window.ethereum.on('accountsChanged', (a) => log('event accountsChanged', a));
+          window.ethereum.on('chainChanged', (c) => log('event chainChanged', c));
+          document.getElementById('log').textContent = 'Provider detected: ' + (window.ethereum.isMiniWallet ? 'MiniWallet' : 'other wallet');
+        }
+      });
+
+      window.addEventListener('eip6963:announceProvider', (e) => log('EIP-6963 announced: ' + e.detail.info.name));
+      window.dispatchEvent(new Event('eip6963:requestProvider'));
+    </script>
+  </body>
+</html>
