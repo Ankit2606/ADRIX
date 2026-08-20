@@ -1,9 +1,9 @@
 import { getAddress, isHexString, toUtf8String } from 'ethers';
 import { getChainId, getNetwork, setChain, addNetwork, allNetworks } from './networks.js';
-import { getWallet, hasVault, isUnlocked } from './keyring.js';
+import { getWallet, hasVault, isUnlocked, listAccounts } from './keyring.js';
 import * as permissions from './permissions.js';
 import { askUser } from './approvals.js';
-import { sendTransaction, estimateGas, describeTransaction } from './transactions.js';
+import { sendTransaction, estimateGas, describeTransaction, inspectApproval } from './transactions.js';
 import { addToken } from './tokens.js';
 import { broadcastEvent, notifyUi } from './events.js';
 import { isDomainFlagged, isAddressFlagged } from './security.js';
@@ -36,6 +36,21 @@ async function requireUnlockedAccount(origin, address) {
   if (!accounts.some((a) => a.toLowerCase() === target.toLowerCase())) {
     fail(4100, 'That account is not authorised for this site.');
   }
+
+  // Reject an account that can never sign *before* estimating gas and putting a
+  // prompt in front of the user. Without this the request runs the whole way to
+  // getWallet() and fails there, after the user has already clicked Confirm.
+  const account = (await listAccounts()).find((a) => a.address.toLowerCase() === target.toLowerCase());
+  if (account && account.type !== 'hd' && account.type !== 'imported') {
+    const reason = {
+      watch: 'That is a watch-only account. ADRIX holds no key for it and cannot sign.',
+      hardware: 'Hardware wallet signing is not implemented in ADRIX yet.',
+      smart: 'Smart accounts need an ERC-4337 bundler, which ADRIX does not have yet.',
+      multisig: 'Multisig accounts need co-owner signatures, which ADRIX cannot gather yet.',
+    }[account.type];
+    fail(4100, reason ?? 'That account cannot sign transactions.');
+  }
+
   // A locked wallet is not an error here: the approval window unlocks inline,
   // and getWallet() throws if the user backs out of that.
   return target;
@@ -208,6 +223,19 @@ export async function handleRpc(method, params = [], origin) {
         data: tx.data ?? '0x',
       });
 
+      const summary = describeTransaction({ to: tx.to, value: tx.value ?? '0x0', data: tx.data ?? '0x' });
+
+      // An approve call is priced against what the allowance already is, which
+      // the calldata alone cannot say.
+      const approvalContext = summary.spender
+        ? await inspectApproval({
+            owner: account,
+            contract: tx.to,
+            data: tx.data ?? '0x',
+            chainId,
+          }).catch(() => null)
+        : null;
+
       const decision = await askUser({
         kind: 'transaction',
         origin,
@@ -219,7 +247,8 @@ export async function handleRpc(method, params = [], origin) {
         symbol: network.symbol,
         explorer: network.explorer,
         gasInfo,
-        summary: describeTransaction({ to: tx.to, value: tx.value ?? '0x0', data: tx.data ?? '0x' }),
+        summary,
+        approvalContext,
         suggestedGas: tx.gas ?? tx.gasLimit ?? null,
       });
       await permissions.touch(origin, 'transaction', {

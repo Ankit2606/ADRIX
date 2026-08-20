@@ -8,6 +8,9 @@ import * as txs from './transactions.js';
 import * as contacts from './contacts.js';
 import * as approvals from './approvals.js';
 import * as ens from './ens.js';
+import * as prices from './prices.js';
+import * as i18n from './i18n.js';
+import * as spam from './spam.js';
 import { handleRpc } from './rpc.js';
 import { broadcastEvent, notifyUi } from './events.js';
 
@@ -67,6 +70,13 @@ async function getState() {
     contactList,
     theme,
     autoLockMinutes,
+    currency,
+    locale,
+    showTestnets,
+    visibleNets,
+    backup,
+    vaults,
+    ensAvatars,
   ] = await Promise.all([
     keyring.hasVault(),
     keyring.isUnlocked(),
@@ -76,12 +86,19 @@ async function getState() {
     keyring.getSelected(),
     networks.getChainId(),
     networks.allNetworks(),
-    networks.getNetworkHealth(),
+    networks.peekNetworkHealth(),
     permissions.listSites(),
     permissions.listHistory(),
     contacts.listContacts(),
     local.get('theme', 'dark'),
     local.get('autoLockMinutes', DEFAULT_AUTOLOCK_MINUTES),
+    prices.getCurrency(),
+    i18n.getLocale(),
+    networks.getShowTestnets(),
+    networks.visibleNetworks(),
+    keyring.getBackupState(),
+    keyring.listVaults(),
+    ens.getAvatarsEnabled(),
   ]);
 
   const [profiledAccounts, profiledHiddenAccounts] = await Promise.all([
@@ -99,13 +116,49 @@ async function getState() {
     chainId,
     network: allNetworks[chainId] ?? null,
     networkHealth,
-    networks: allNetworks,
+    networks: visibleNets,
+    allNetworks,
+    showTestnets,
     sites,
     connectionHistory,
     contacts: contactList,
     theme,
     autoLockMinutes,
+    currency,
+    locale,
+    backup,
+    vaults,
+    ensAvatars,
+    derivationPresets: keyring.DERIVATION_PRESETS,
     pendingApprovals: approvals.pendingCount(),
+  };
+}
+
+/** Attaches live fiat values to one chain's native balance and token list. */
+async function priceChain(chainId, nativeBalanceStr, tokenList, currency) {
+  const [native, tokenMap] = await Promise.all([
+    prices.nativePrice(chainId, currency),
+    prices.tokenPrices(
+      chainId,
+      tokenList.map((token) => token.address),
+      currency
+    ),
+  ]);
+
+  const pricedTokens = tokenList.map((token) => {
+    const price = tokenMap[token.address.toLowerCase()] ?? null;
+    return { ...token, price, fiat: prices.fiatValue(token.balance, price) };
+  });
+
+  return {
+    nativePrice: native,
+    nativeFiat: prices.fiatValue(nativeBalanceStr, native),
+    tokens: pricedTokens,
+    // Only chains with real price data contribute to a total. A missing price
+    // is not zero, so it must not be summed as though it were.
+    total: [prices.fiatValue(nativeBalanceStr, native), ...pricedTokens.map((t) => t.fiat)]
+      .filter((value) => value != null)
+      .reduce((sum, value) => sum + value, 0),
   };
 }
 
@@ -118,8 +171,7 @@ async function getPortfolio() {
   const provider = await networks.getProvider(chainId);
   const accounts = await keyring.listVisibleAccounts();
   const selectedAccount = accounts.find((account) => account.address.toLowerCase() === address.toLowerCase()) ?? null;
-  const { fetchPrices, calculateFiatValue } = await import('./prices.js');
-  const prices = await fetchPrices();
+  const currency = await prices.getCurrency();
 
   const [balance, tokenList, activity, profile] = await Promise.all([
     provider.getBalance(address).catch(() => 0n),
@@ -127,7 +179,7 @@ async function getPortfolio() {
     txs.listActivity(address, chainId),
     ens.profileAddress(address).catch(() => null),
   ]);
-  const [nftList, approvals, hiddenTokens, hiddenNfts] = await Promise.all([
+  const [nftList, approvalList, hiddenTokens, hiddenNfts] = await Promise.all([
     tokens.nftBalances(address, chainId).catch(() => []),
     tokens.listApprovals(address, chainId).catch(() => []),
     tokens.listHiddenTokens(chainId).catch(() => []),
@@ -135,96 +187,108 @@ async function getPortfolio() {
   ]);
 
   const nativeBalanceStr = formatEther(balance);
-  const nativeFiat = await calculateFiatValue(network.symbol, nativeBalanceStr);
-
-  const tokensWithFiat = await Promise.all(tokenList.map(async (t) => {
-    const fiat = await calculateFiatValue(t.symbol, t.balance);
-    return { ...t, fiat };
-  }));
+  const priced = await priceChain(chainId, nativeBalanceStr, tokenList, currency);
 
   return {
     address,
     account: selectedAccount ? { ...selectedAccount, ens: profile } : null,
     chainId,
     network,
-    native: { symbol: network.symbol, balance: nativeBalanceStr, raw: balance.toString(), fiat: nativeFiat },
-    tokens: tokensWithFiat,
-    nfts: nftList,
+    currency,
+    native: {
+      symbol: network.symbol,
+      balance: nativeBalanceStr,
+      raw: balance.toString(),
+      price: priced.nativePrice,
+      fiat: priced.nativeFiat,
+    },
+    tokens: spam.annotateTokens(priced.tokens, { chainId }),
+    totalFiat: priced.total,
+    nfts: spam.annotateNfts(nftList),
     hiddenTokens,
     hiddenNfts,
-    approvals,
+    approvals: approvalList,
     activity,
+    pending: activity.filter((tx) => tx.status === 'pending').length,
   };
 }
 
 async function getPortfolios() {
   const currentChainId = await networks.getChainId();
-  const allNets = await networks.allNetworks();
+  const allNets = await networks.visibleNetworks();
   const accounts = await ens.enrichAccounts(await keyring.listVisibleAccounts());
-  const { fetchPrices, calculateFiatValue } = await import('./prices.js');
-  
-  let totalNativeRaw = 0n;
-  let totalFiat = 0;
+  const currency = await prices.getCurrency();
 
   const rows = await Promise.all(
     accounts.map(async (account) => {
-      let accTotalFiat = 0;
-      
-      const chainBalances = await Promise.all(
-        Object.values(allNets).map(async (net) => {
-          try {
-            const provider = await networks.getProvider(net.chainId);
-            const balance = await provider.getBalance(account.address).catch(() => 0n);
-            const tokenList = await tokens.tokenBalances(account.address, net.chainId).catch(() => []);
-            const nftList = await tokens.nftBalances(account.address, net.chainId).catch(() => []);
-            
-            const balStr = formatEther(balance);
-            const fiat = await calculateFiatValue(net.symbol, balStr);
-            accTotalFiat += fiat;
-            
-            const tokensWithFiat = await Promise.all(tokenList.map(async (t) => {
-              const tFiat = await calculateFiatValue(t.symbol, t.balance);
-              accTotalFiat += tFiat;
-              return { ...t, fiat: tFiat };
-            }));
+      const chainBalances = (
+        await Promise.all(
+          Object.values(allNets).map(async (net) => {
+            try {
+              const provider = await networks.getProvider(net.chainId);
+              const [balance, tokenList, nftList] = await Promise.all([
+                provider.getBalance(account.address).catch(() => 0n),
+                tokens.tokenBalances(account.address, net.chainId).catch(() => []),
+                tokens.nftBalances(account.address, net.chainId).catch(() => []),
+              ]);
 
-            if (net.chainId === currentChainId) {
-              totalNativeRaw += balance;
+              const balanceStr = formatEther(balance);
+              const priced = await priceChain(net.chainId, balanceStr, tokenList, currency);
+
+              return {
+                chainId: net.chainId,
+                network: net,
+                fiat: priced.total,
+                native: {
+                  symbol: net.symbol,
+                  balance: balanceStr,
+                  raw: balance.toString(),
+                  price: priced.nativePrice,
+                  fiat: priced.nativeFiat,
+                },
+                tokens: priced.tokens.filter((token) => token.raw && BigInt(token.raw) > 0n),
+                nfts: nftList.filter((nft) => nft.balance != null && BigInt(nft.balance) > 0n),
+              };
+            } catch {
+              return null;
             }
+          })
+        )
+      ).filter(Boolean);
 
-            return {
-              chainId: net.chainId,
-              network: net,
-              native: { symbol: net.symbol, balance: balStr, raw: balance.toString(), fiat },
-              tokens: tokensWithFiat.filter((token) => token.raw && BigInt(token.raw) > 0n),
-              nfts: nftList.filter((nft) => nft.balance != null && BigInt(nft.balance) > 0n),
-            };
-          } catch (e) {
-            return null;
-          }
-        })
-      );
-      
-      const validChainBalances = chainBalances.filter(Boolean);
-      totalFiat += accTotalFiat;
+      // Each account's total is its own — not a running sum across the map,
+      // which is order-dependent when the callbacks resolve concurrently.
+      const accountFiat = chainBalances.reduce((sum, chain) => sum + chain.fiat, 0);
 
       return {
         ...account,
-        chainBalances: validChainBalances,
-        totalFiat,
-        native: validChainBalances.find(c => c.chainId === currentChainId)?.native || { symbol: 'ETH', balance: '0', raw: '0', fiat: 0 },
-        tokens: validChainBalances.flatMap(c => c.tokens),
-        nfts: validChainBalances.flatMap(c => c.nfts),
+        chainBalances,
+        totalFiat: accountFiat,
+        native: chainBalances.find((c) => c.chainId === currentChainId)?.native ?? {
+          symbol: allNets[currentChainId]?.symbol ?? 'ETH',
+          balance: '0',
+          raw: '0',
+          fiat: null,
+        },
+        tokens: chainBalances.flatMap((c) => c.tokens),
+        nfts: chainBalances.flatMap((c) => c.nfts),
       };
     })
   );
 
   const currentNetwork = await networks.getNetwork(currentChainId);
+  const totalNativeRaw = rows.reduce((sum, row) => sum + BigInt(row.native.raw ?? '0'), 0n);
+
   return {
     chainId: currentChainId,
     network: currentNetwork,
-    native: { symbol: currentNetwork.symbol, balance: formatEther(totalNativeRaw), raw: totalNativeRaw.toString() },
-    totalFiat,
+    currency,
+    native: {
+      symbol: currentNetwork.symbol,
+      balance: formatEther(totalNativeRaw),
+      raw: totalNativeRaw.toString(),
+    },
+    totalFiat: rows.reduce((sum, row) => sum + row.totalFiat, 0),
     accounts: rows,
   };
 }
@@ -239,9 +303,41 @@ const handlers = {
 
   // --- vault ---------------------------------------------------------------
   CREATE_WALLET: ({ password }) => keyring.createVault(password),
-  IMPORT_MNEMONIC: ({ password, mnemonic }) => keyring.createVault(password, mnemonic.trim().replace(/\s+/g, ' ')),
+  IMPORT_MNEMONIC: ({ password, mnemonic, pathTemplate }) =>
+    keyring.createVault(password, mnemonic, pathTemplate),
   IMPORT_PRIVATE_KEY_WALLET: ({ password, privateKey, name }) =>
     keyring.createPrivateKeyVault(password, privateKey, name),
+  IMPORT_KEYSTORE_WALLET: ({ password, keystore, keystorePassword, name }) =>
+    keyring.createKeystoreVault(password, keystore, keystorePassword, name),
+  PREVIEW_DERIVATION: ({ mnemonic }) => ({ presets: keyring.previewDerivation(mnemonic) }),
+  PREVIEW_CUSTOM_DERIVATION: ({ mnemonic, template }) => keyring.previewCustomDerivation(mnemonic, template),
+
+  // --- recovery phrases (vaults) -------------------------------------------
+  LIST_VAULTS: () => keyring.listVaults(),
+  ADD_VAULT: async ({ mnemonic, name, pathTemplate }) => {
+    const vault = await keyring.addVault({ mnemonic, name, pathTemplate });
+    broadcastEvent('accountsChanged');
+    return vault;
+  },
+  RENAME_VAULT: ({ id, name }) => keyring.renameVault(id, name),
+  REMOVE_VAULT: async ({ id }) => {
+    // Capture the addresses before they are dropped, so their site grants can
+    // be revoked too — otherwise a re-imported phrase would silently inherit
+    // permissions the user granted in a previous session.
+    const doomed = (await keyring.listAccounts()).filter((account) => account.vaultId === id);
+    await keyring.removeVault(id);
+    for (const account of doomed) await permissions.purgeAccount(account.address);
+    broadcastEvent('accountsChanged');
+    notifyUi();
+    return { ok: true };
+  },
+  REVEAL_VAULT_MNEMONIC: ({ id, password }) =>
+    keyring.revealVaultMnemonic(id, password).then((mnemonic) => ({ mnemonic })),
+
+  // --- backup --------------------------------------------------------------
+  GET_BACKUP_STATE: () => keyring.getBackupState(),
+  VERIFY_BACKUP: ({ words }) => keyring.verifyBackup(words),
+  CONFIRM_BACKUP: () => keyring.confirmBackup(),
   UNLOCK: async ({ password }) => {
     await keyring.unlock(password);
     await resetAutoLock();
@@ -255,13 +351,18 @@ const handlers = {
   WIPE: () => keyring.wipe(),
 
   // --- accounts ------------------------------------------------------------
-  ADD_ACCOUNT: async ({ name }) => {
-    const account = await keyring.addAccount(name);
+  ADD_ACCOUNT: async ({ name, vaultId }) => {
+    const account = await keyring.addAccount(name, vaultId);
     broadcastEvent('accountsChanged');
     return account;
   },
   IMPORT_PRIVATE_KEY: async ({ privateKey, name }) => {
     const account = await keyring.importPrivateKey(privateKey, name);
+    broadcastEvent('accountsChanged');
+    return account;
+  },
+  IMPORT_KEYSTORE: async ({ keystore, keystorePassword, name }) => {
+    const account = await keyring.importKeystore(keystore, keystorePassword, name);
     broadcastEvent('accountsChanged');
     return account;
   },
@@ -291,6 +392,17 @@ const handlers = {
     return { ok: true };
   },
   RENAME_ACCOUNT: ({ address, name }) => keyring.renameAccount(address, name),
+  UPGRADE_WATCH_ACCOUNT: async ({ address, privateKey }) => {
+    const account = await keyring.upgradeWatchAccount(address, privateKey);
+    broadcastEvent('accountsChanged');
+    notifyUi();
+    return account;
+  },
+  SET_ENS_AVATARS: async ({ value }) => {
+    await ens.setAvatarsEnabled(value);
+    notifyUi();
+    return { ok: true };
+  },
   REMOVE_ACCOUNT: async ({ address }) => {
     await keyring.removeAccount(address);
     await permissions.purgeAccount(address);
@@ -317,11 +429,29 @@ const handlers = {
     return network;
   },
   ADD_NETWORK: ({ network }) => networks.addNetwork(network),
+  EDIT_NETWORK: async ({ chainId, network }) => {
+    const updated = await networks.editNetwork(chainId, network);
+    notifyUi();
+    return updated;
+  },
+  RESET_NETWORK: async ({ chainId }) => {
+    const restored = await networks.resetNetwork(chainId);
+    notifyUi();
+    return restored;
+  },
   TEST_RPC: ({ network }) => networks.testRpc(network),
+  CHECK_NETWORK_HEALTH: async ({ chainId, force = true }) => networks.getNetworkHealth(chainId, { force }),
+  CHECK_ALL_NETWORKS: () => networks.checkAllNetworks(),
   REMOVE_NETWORK: async ({ chainId }) => {
     await networks.removeNetwork(chainId);
     await permissions.purgeNetwork(chainId);
     broadcastEvent('chainChanged', await networks.getChainId());
+    return { ok: true };
+  },
+  SET_SHOW_TESTNETS: async ({ value }) => {
+    await networks.setShowTestnets(value);
+    broadcastEvent('chainChanged', await networks.getChainId());
+    notifyUi();
     return { ok: true };
   },
 
@@ -332,11 +462,21 @@ const handlers = {
   ADD_TOKEN: ({ token }) => tokens.addToken(token),
   REMOVE_TOKEN: ({ address }) => tokens.removeToken(address),
   HIDE_TOKEN: ({ address }) => tokens.hideToken(address),
+  HIDE_TOKENS: async ({ addresses }) => {
+    for (const address of addresses ?? []) await tokens.hideToken(address).catch(() => {});
+    notifyUi();
+    return { hidden: (addresses ?? []).length };
+  },
   UNHIDE_TOKEN: ({ address }) => tokens.unhideToken(address),
   LOOKUP_NFT: async ({ nft }) => tokens.lookupNft(nft, await keyring.getSelected()),
   ADD_NFT: ({ nft }) => tokens.addNft(nft),
   REMOVE_NFT: ({ nft }) => tokens.removeNft(nft),
   HIDE_NFT: ({ nft }) => tokens.hideNft(nft),
+  HIDE_NFTS: async ({ nfts: list }) => {
+    for (const nft of list ?? []) await tokens.hideNft(nft).catch(() => {});
+    notifyUi();
+    return { hidden: (list ?? []).length };
+  },
   UNHIDE_NFT: ({ nft }) => tokens.unhideNft(nft),
   LOOKUP_ENS_PROFILE: ({ address }) => ens.profileAddress(address),
   // The Send screen needs calldata before it can estimate gas. It asks here
@@ -346,11 +486,60 @@ const handlers = {
 
   // --- sending -------------------------------------------------------------
   RESOLVE_RECIPIENT: ({ input }) => txs.resolveRecipient(input).then((address) => ({ address })),
+  INSPECT_RECIPIENT: ({ input }) => txs.inspectRecipient(input),
+  PARSE_PAYMENT_URI: ({ input }) => ({ parsed: txs.parsePaymentUri(input) }),
+  GET_TRANSACTION_DETAIL: ({ hash }) => txs.getTransactionDetail(hash),
+  GET_NONCE_INFO: async ({ address }) => txs.getNonceInfo(address ?? (await keyring.getSelected())),
+  VALIDATE_FEES: ({ fees, gasInfo }) => txs.validateFees(fees, gasInfo),
+  LIST_PENDING: async () => txs.listPending(await keyring.getSelected()),
   ESTIMATE_GAS: ({ request }) => txs.estimateGas(request),
   SEND_TRANSACTION: async ({ request }) => {
     const hash = await txs.sendTransaction(request);
+    await contacts.recordContactUse(request.to);
     return { hash };
   },
+  // --- NFT transfer ---------------------------------------------------------
+  CHECK_NFT_TRANSFER: async ({ nft, to, amount }) => {
+    const owner = await keyring.getSelected();
+    const [transferable, recipient] = await Promise.all([
+      tokens.checkNftTransferable({ ...nft, owner, amount }),
+      to ? tokens.checkNftRecipient(to) : Promise.resolve(null),
+    ]);
+    return { transferable, recipient };
+  },
+  ESTIMATE_NFT_TRANSFER: async ({ nft, to, amount }) => {
+    const from = await keyring.getSelected();
+    const data = tokens.encodeNftTransfer({ standard: nft.standard, from, to, tokenId: nft.tokenId, amount });
+    return txs.estimateGas({ from, to: nft.address, value: '0x0', data });
+  },
+  SEND_NFT: async ({ nft, to, amount, fees, gas, nonce }) => {
+    const from = await keyring.getSelected();
+    // Re-checked at send time, not just at review time: ownership can change
+    // between the two, and the transaction would revert after paying gas.
+    await tokens.checkNftTransferable({ ...nft, owner: from, amount });
+
+    const hash = await txs.sendTransaction({
+      from,
+      to: nft.address,
+      value: '0x0',
+      data: tokens.encodeNftTransfer({ standard: nft.standard, from, to, tokenId: nft.tokenId, amount }),
+      fees,
+      gas,
+      nonce,
+      meta: {
+        kind: 'nftTransfer',
+        nftAddress: nft.address,
+        nftTokenId: String(nft.tokenId),
+        nftStandard: nft.standard,
+        nftTitle: nft.title || nft.name || '',
+        nftAmount: String(amount ?? 1),
+        nftTo: to,
+      },
+    });
+    await contacts.recordContactUse(to);
+    return { hash };
+  },
+
   SEND_TOKEN: async ({ from, token, to, amount, fees, gas, nonce }) => {
     const hash = await txs.sendTransaction({
       from,
@@ -362,21 +551,48 @@ const handlers = {
       nonce,
       meta: { tokenSymbol: token.symbol, tokenAmount: String(amount), tokenTo: to },
     });
+    await contacts.recordContactUse(to);
     return { hash };
   },
   SPEED_UP: ({ hash }) => txs.speedUp(hash).then((newHash) => ({ hash: newHash })),
   CANCEL_TX: ({ hash }) => txs.cancelTransaction(hash).then((newHash) => ({ hash: newHash })),
   UPDATE_TX_META: ({ hash, note, tags }) => txs.updateActivityMeta({ hash, note, tags }),
-  REVOKE_APPROVAL: async ({ id }) => {
-    const hash = await txs.revokeApproval({ id, from: await keyring.getSelected() });
+  LIST_TAGS: async ({ chainId } = {}) =>
+    ({ tags: await txs.listTags(await keyring.getSelected(), chainId ?? (await networks.getChainId())) }),
+  TOGGLE_TX_TAG: ({ hash, tag }) => txs.toggleActivityTag({ hash, tag }),
+  RENAME_TAG: async ({ from, to }) => {
+    const result = await txs.renameTag({ from, to });
+    notifyUi();
+    return result;
+  },
+  QUOTE_REVOKE: async ({ id }) => txs.quoteRevoke({ id, from: await keyring.getSelected() }),
+  REVOKE_APPROVAL: async ({ id, fees, gas }) => {
+    const hash = await txs.revokeApproval({ id, fees, gas, from: await keyring.getSelected() });
     return { hash };
   },
+  REVOKE_APPROVALS: async ({ ids }) => txs.revokeApprovals({ ids, from: await keyring.getSelected() }),
+  INSPECT_APPROVAL: async ({ contract, data, chainId }) =>
+    txs.inspectApproval({ owner: await keyring.getSelected(), contract, data, chainId }),
 
   // --- sites ---------------------------------------------------------------
   DISCONNECT_SITE: async ({ origin }) => {
     await permissions.revoke(origin);
     broadcastEvent('accountsChanged', [], origin);
+    notifyUi();
     return { ok: true };
+  },
+  DISCONNECT_ALL_SITES: async () => {
+    const result = await permissions.revokeAll();
+    for (const origin of result.origins) broadcastEvent('accountsChanged', [], origin);
+    notifyUi();
+    return result;
+  },
+  GET_SITE_ACTIVITY: ({ origin }) => permissions.siteActivity(origin),
+  LIST_HISTORY_ORIGINS: async () => ({ origins: await permissions.listHistoryOrigins() }),
+  CLEAR_HISTORY: async () => {
+    const result = await permissions.clearHistory();
+    notifyUi();
+    return result;
   },
   UPDATE_SITE_ACCOUNTS: async ({ origin, accounts }) => {
     await permissions.updateAccounts(origin, accounts);
@@ -396,6 +612,14 @@ const handlers = {
 
   // --- contacts ------------------------------------------------------------
   LIST_CONTACTS: () => contacts.listContacts(),
+  LIST_CONTACT_LABELS: async () => ({ labels: await contacts.listLabels() }),
+  FIND_CONTACT: ({ address }) => contacts.findContactByAddress(address),
+  EXPORT_CONTACTS: () => contacts.exportContacts(),
+  IMPORT_CONTACTS: async ({ payload }) => {
+    const result = await contacts.importContacts(payload);
+    notifyUi();
+    return result;
+  },
   ADD_CONTACT: ({ contact }) => contacts.addContact(contact),
   UPDATE_CONTACT: ({ contact }) => contacts.updateContact(contact),
   TOGGLE_CONTACT_FAVORITE: ({ id }) => contacts.toggleFavorite({ id }),
@@ -413,6 +637,17 @@ const handlers = {
     notifyUi();
     return { ok: true };
   },
+  SET_CURRENCY: async ({ currency }) => {
+    await prices.setCurrency(currency);
+    notifyUi();
+    return { ok: true };
+  },
+  SET_LOCALE: async ({ locale }) => {
+    await i18n.setLocale(locale);
+    notifyUi();
+    return { ok: true };
+  },
+  GET_CURRENCIES: () => ({ currencies: prices.FIAT_CURRENCIES, locales: i18n.LOCALES }),
 
   // --- approvals -----------------------------------------------------------
   GET_APPROVAL: async ({ id }) => {

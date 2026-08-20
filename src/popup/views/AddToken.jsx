@@ -1,150 +1,162 @@
-import { useState } from 'react';
-import { call, shorten, trimAmount } from '../../lib/ui.js';
-import { BackBar } from '../components/common.jsx';
+import { useEffect, useState } from 'react';
+import { call, shorten, useDebounced, useAsyncAction } from '../../lib/ui.js';
+import { BackBar, EmptyState, Skeleton } from '../components/common.jsx';
 
 export default function AddToken({ state, go }) {
-  const [address, setAddress] = useState('');
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
-  const [token, setToken] = useState(null);
-  const [nftAddress, setNftAddress] = useState('');
-  const [nftTokenId, setNftTokenId] = useState('');
-  const [nft, setNft] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
-
-  const lookup = async () => {
-    setBusy(true);
-    setError('');
-    setMessage('');
-    setToken(null);
-    try {
-      setToken(await call('LOOKUP_TOKEN', { address }));
-    } catch {
-      setError('No ERC-20 token found at that address on this network.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const lookupNft = async () => {
-    setBusy(true);
-    setError('');
-    setMessage('');
-    setNft(null);
-    try {
-      setNft(await call('LOOKUP_NFT', { nft: { address: nftAddress, tokenId: nftTokenId } }));
-    } catch (err) {
-      setError(err.message || 'No ERC-721 or ERC-1155 token found at that address and token ID.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const search = async () => {
-    setBusy(true);
-    setError('');
-    setMessage('');
-    try {
-      setResults(await call('SEARCH_TOKENS', { query }));
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const detect = async () => {
-    setBusy(true);
-    setError('');
-    setMessage('');
-    try {
-      const detected = await call('DETECT_TOKENS');
-      setMessage(
-        detected.length
-          ? `Added ${detected.length} token${detected.length === 1 ? '' : 's'} with a balance.`
-          : 'No new common tokens with a balance were found.'
-      );
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const add = async (nextToken) => {
-    await call('ADD_TOKEN', { token: nextToken });
-    go('home');
-  };
-
-  const addNft = async () => {
-    await call('ADD_NFT', { nft });
-    go('home');
-  };
+  const [tab, setTab] = useState('token');
 
   return (
     <div className="screen">
-      <BackBar title="Add token" onBack={() => go('home')} />
+      <BackBar title={tab === 'token' ? 'Add token' : 'Track NFT'} onBack={() => go('home')} />
       <div className="scroll pad stack">
-        <div className="card">
-          <h2>Search common tokens</h2>
-          <label className="field">
-            <span>Name, symbol, or address</span>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && search()}
-              placeholder={`Search on ${state.network?.name ?? 'this network'}`}
-            />
-          </label>
-          <div className="row2">
-            <button className="ghost" onClick={detect} disabled={busy}>
-              Auto-detect
-            </button>
-            <button className="primary" onClick={search} disabled={busy}>
-              Search
-            </button>
-          </div>
-          {results.length > 0 && (
-            <div className="list">
-              {results.map((result) => (
-                <div className="item static" key={result.address}>
-                  <span className="avatar" style={{ background: 'var(--surface-2)', border: '1px solid var(--line)' }} />
-                  <div className="item-main">
-                    <span className="item-title">{result.symbol}</span>
-                    <span className="item-sub">
-                      {result.name} · {shorten(result.address)}
-                    </span>
-                  </div>
-                  <button className="link" onClick={() => add(result)}>
-                    add
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
+        <div className="tabs" role="tablist" aria-label="Asset type">
+          <button role="tab" aria-selected={tab === 'token'} onClick={() => setTab('token')}>
+            ERC-20 token
+          </button>
+          <button role="tab" aria-selected={tab === 'nft'} onClick={() => setTab('nft')}>
+            NFT
+          </button>
         </div>
 
+        {tab === 'token' ? <TokenTab state={state} go={go} /> : <NftTab go={go} />}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+function TokenTab({ state, go }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [address, setAddress] = useState('');
+  const [token, setToken] = useState(null);
+  const [detected, setDetected] = useState(null);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  const debouncedQuery = useDebounced(query, 350);
+
+  // Search runs as the user types against the on-device registry — no network
+  // call, so there is no reason to make them press a button.
+  useEffect(() => {
+    let cancelled = false;
+    setSearching(true);
+    call('SEARCH_TOKENS', { query: debouncedQuery })
+      .then((list) => !cancelled && setResults(list))
+      .catch(() => !cancelled && setResults([]))
+      .finally(() => !cancelled && setSearching(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedQuery, state.chainId]);
+
+  const lookup = () =>
+    run(async () => {
+      setToken(null);
+      setDetected(null);
+      const result = await call('LOOKUP_TOKEN', { address });
+      setToken(result);
+    });
+
+  const detect = () =>
+    run(async () => {
+      setToken(null);
+      setDetected(await call('DETECT_TOKENS'));
+    });
+
+  const add = (nextToken) =>
+    run(async () => {
+      await call('ADD_TOKEN', { token: nextToken });
+      go('home');
+    });
+
+  return (
+    <>
+      <div className="card">
+        <div className="between">
+          <h2>Find a token</h2>
+          <button className="link accent" onClick={detect} disabled={busy}>
+            {busy ? 'scanning…' : 'auto-detect'}
+          </button>
+        </div>
+        <p className="small">
+          Auto-detect checks your balance for the common tokens on {state.network?.name ?? 'this network'} and adds any
+          you hold.
+        </p>
+
+        <label className="field">
+          <span>Search by name, symbol, or address</span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={`Tokens known on ${state.network?.name ?? 'this network'}`}
+            type="search"
+            autoFocus
+          />
+        </label>
+
+        {detected && (
+          <div className={detected.length ? 'ok' : 'notice'}>
+            {detected.length
+              ? `Added ${detected.length} token${detected.length === 1 ? '' : 's'} with a balance: ${detected
+                  .map((t) => t.symbol)
+                  .join(', ')}.`
+              : 'No common tokens with a balance were found on this network.'}
+          </div>
+        )}
+
+        {searching && !results.length ? (
+          <Skeleton height={44} radius={10} />
+        ) : results.length ? (
+          <div className="list">
+            {results.map((result) => (
+              <div className="item static compact" key={result.address}>
+                <span className="token-icon sm">{result.symbol.charAt(0)}</span>
+                <div className="item-main">
+                  <span className="item-title">{result.symbol}</span>
+                  <span className="item-sub">
+                    {result.name} · {shorten(result.address)}
+                  </span>
+                </div>
+                <button className="link accent" onClick={() => add(result)} disabled={busy}>
+                  add
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            icon="⌕"
+            title={query ? 'Not in the built-in list' : 'No tokens listed for this network'}
+            body="Add it by contract address below — the symbol, name, and decimals are read from the chain."
+          />
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Add by contract address</h2>
         <label className="field">
           <span>Token contract address</span>
           <input
             className="mono"
-            placeholder="0x..."
+            placeholder="0x…"
             value={address}
-            onChange={(e) => setAddress(e.target.value)}
+            onChange={(e) => {
+              setAddress(e.target.value);
+              setError('');
+              setToken(null);
+            }}
             spellCheck="false"
           />
         </label>
         <button className="ghost" onClick={lookup} disabled={busy || !address}>
-          {busy ? 'Reading contract...' : 'Look up token'}
+          {busy ? 'Reading contract…' : 'Look up token'}
         </button>
 
-        {error && <div className="error">{error}</div>}
-        {message && <div className="ok">{message}</div>}
+        {error && <div className="error" role="alert">{error}</div>}
 
         {token && (
-          <div className="card">
+          <div className="stack-sm">
             <div className="between">
               <span className="small">Name</span>
               <span>{token.name || '--'}</span>
@@ -157,74 +169,112 @@ export default function AddToken({ state, go }) {
               <span className="small">Decimals</span>
               <span className="mono">{token.decimals}</span>
             </div>
-            {token.balance && (
-              <div className="between">
-                <span className="small">Balance</span>
-                <span className="mono">{trimAmount(token.balance)}</span>
-              </div>
-            )}
+            <div className="between">
+              <span className="small">Contract</span>
+              <span className="mono small">{shorten(token.address, 8, 6)}</span>
+            </div>
+            <button className="primary" onClick={() => add(token)} disabled={busy}>
+              Add {token.symbol}
+            </button>
           </div>
         )}
 
-        <div className="card">
-          <h2>Track NFT</h2>
-          <label className="field">
-            <span>NFT contract address</span>
-            <input
-              className="mono"
-              placeholder="0x..."
-              value={nftAddress}
-              onChange={(e) => setNftAddress(e.target.value)}
-              spellCheck="false"
-            />
-          </label>
-          <label className="field">
-            <span>Token ID</span>
-            <input
-              className="mono"
-              inputMode="numeric"
-              value={nftTokenId}
-              onChange={(e) => setNftTokenId(e.target.value)}
-              placeholder="1"
-            />
-          </label>
-          <button className="ghost" onClick={lookupNft} disabled={busy || !nftAddress || !nftTokenId}>
-            {busy ? 'Reading NFT...' : 'Look up NFT'}
-          </button>
-          {nft && (
-            <div className="item static">
-              {nft.image ? (
-                <img className="nft-thumb" src={nft.image} alt="" />
-              ) : (
-                <span className="avatar" style={{ background: 'var(--surface-2)', border: '1px solid var(--line)' }} />
-              )}
-              <div className="item-main">
-                <span className="item-title">{nft.title || nft.name || `${nft.standard} #${nft.tokenId}`}</span>
-                <span className="item-sub">
-                  {nft.standard} · balance {nft.balance ?? '--'}
-                </span>
-              </div>
-              <button className="link accent" onClick={addNft}>
-                add
-              </button>
-            </div>
-          )}
-        </div>
-
-        <p className="small">
-          Tokens and NFTs are saved per network. The same contract on another chain has to be added there separately.
+        <p className="small faint">
+          Tokens are saved per network. The same contract on another chain has to be added there separately.
         </p>
       </div>
+    </>
+  );
+}
 
-      <div className="footer">
-        <button
-          className="primary"
-          disabled={!token}
-          onClick={() => add(token)}
-        >
-          Add token
-        </button>
-      </div>
+// ---------------------------------------------------------------------------
+function NftTab({ go }) {
+  const [address, setAddress] = useState('');
+  const [tokenId, setTokenId] = useState('');
+  const [nft, setNft] = useState(null);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  const lookup = () =>
+    run(async () => {
+      setNft(null);
+      setNft(await call('LOOKUP_NFT', { nft: { address, tokenId } }));
+    });
+
+  const add = () =>
+    run(async () => {
+      await call('ADD_NFT', { nft });
+      go('home');
+    });
+
+  return (
+    <div className="card">
+      <h2>Track an NFT</h2>
+      <p className="small">
+        ADRIX has no NFT indexer, so each token is tracked by contract and ID. ERC-721 and ERC-1155 both work; the
+        standard is detected from the contract.
+      </p>
+
+      <label className="field">
+        <span>NFT contract address</span>
+        <input
+          className="mono"
+          placeholder="0x…"
+          value={address}
+          onChange={(e) => {
+            setAddress(e.target.value);
+            setError('');
+            setNft(null);
+          }}
+          spellCheck="false"
+        />
+      </label>
+      <label className="field">
+        <span>Token ID</span>
+        <input
+          className="mono"
+          inputMode="numeric"
+          value={tokenId}
+          onChange={(e) => {
+            setTokenId(e.target.value);
+            setError('');
+            setNft(null);
+          }}
+          placeholder="1"
+        />
+      </label>
+
+      <button className="ghost" onClick={lookup} disabled={busy || !address || !tokenId}>
+        {busy ? 'Reading contract…' : 'Look up NFT'}
+      </button>
+
+      {error && <div className="error" role="alert">{error}</div>}
+
+      {nft && (
+        <div className="stack-sm">
+          <div className="item static">
+            {nft.image ? (
+              <img className="nft-thumb" src={nft.image} alt="" />
+            ) : (
+              <span className="token-icon">▣</span>
+            )}
+            <div className="item-main">
+              <span className="item-title">{nft.title || nft.name || `${nft.standard} #${nft.tokenId}`}</span>
+              <span className="item-sub">
+                {nft.standard} · you own {nft.balance ?? '--'}
+              </span>
+            </div>
+          </div>
+          {nft.balance === '0' && (
+            <div className="notice">
+              The selected account does not currently own this token. You can still track it.
+            </div>
+          )}
+          {nft.description && <p className="small faint">{nft.description.slice(0, 220)}</p>}
+          <button className="primary" onClick={add} disabled={busy}>
+            Track this NFT
+          </button>
+        </div>
+      )}
     </div>
   );
 }

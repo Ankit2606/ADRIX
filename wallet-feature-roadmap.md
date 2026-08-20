@@ -7,7 +7,6 @@ Updated: 17 Aug 2026
 
 ## Basic
 
-### Your original list
 - Better onboarding with password strength meter
 - Seed phrase re-check before allowing wallet use
 - Import wallet from private key directly
@@ -18,8 +17,6 @@ Updated: 17 Aug 2026
 - Export activity as CSV
 - Dark/light theme
 - Lock timer controls
-
-### Missing / Added
 - **Restore wallet from seed phrase** (12/24 words, with word validation and paste-whole-phrase support)
 - **Import from JSON keystore file** (v3 keystore + password)
 - **Custom derivation path on import** (Ledger Live path, legacy MetaMask path, custom `m/44'/60'/...`)
@@ -48,7 +45,6 @@ Updated: 17 Aug 2026
 
 ## Intermediate
 
-### Your original list
 - Address book, contact labels, favorite recipients
 - Custom gas price, priority fee, max fee controls
 - Nonce management
@@ -68,14 +64,16 @@ Updated: 17 Aug 2026
 - Multi-account portfolio view
 - ENS reverse lookup for addresses
 - ENS avatar display
-
-### Missing / Added
 - **NFT send/transfer flow** — you list NFT *display* but never NFT *sending*
+
+
 - **NFT detail view** with metadata, traits, collection floor, and explorer link
 - **Gas presets with time estimates** (Low / Market / Aggressive → "~30s", "~2 min") on top of the manual fee controls
 - **Base fee history sparkline** so users can see whether to wait
 - **Nonce gap detection** — warn when a stuck low nonce is blocking everything behind it
 - **Multiple RPC endpoints per network with automatic failover**
+
+
 - **Token list import** (Uniswap-style token list URLs) rather than only per-token adds
 - **Custom token edit/remove** (fix wrong decimals, symbols)
 - **`wallet_switchEthereumChain` / `wallet_addEthereumChain` request UI** — the dApp-initiated network prompt
@@ -91,8 +89,6 @@ Updated: 17 Aug 2026
 ---
 
 ## Advanced
-
-### Your original list
 - Transaction simulation before signing
 - Balance change preview before confirmation
 - Token allowance dashboard
@@ -115,8 +111,6 @@ Updated: 17 Aug 2026
 - Gas sponsorship / paymaster support
 - Bundler support for ERC-4337
 - Push notifications for incoming/outgoing transactions
-
-### Missing / Added
 - **EIP-7702 delegation support** — the big gap here. Post-Pectra, plain EOAs can delegate to smart-contract code, which is how most wallets are now delivering batching, sponsorship, and session keys without migrating users to a new 4337 address. Your list jumps straight to 4337/bundlers and skips the path most users will actually take.
 - **Passkey / WebAuthn signing** (secp256r1, EIP-7212) for smart accounts
 - **MPC / threshold-signature accounts** as an alternative to seed-phrase custody
@@ -137,8 +131,6 @@ Updated: 17 Aug 2026
 ---
 
 ## Security
-
-### Your original list
 - Auto-lock on browser idle
 - Require password before every signature/send
 - Phishing warning before connecting to unknown dApps
@@ -152,8 +144,6 @@ Updated: 17 Aug 2026
 - Encrypted backup export/import
 - Local security audit screen
 - Testnet/mainnet warning mode
-
-### Missing / Added
 - **Biometric unlock** (Touch ID / Face ID / Windows Hello via WebAuthn) — password-only unlock is a big friction and abandonment source
 - **Blind-signing warning** — loud, unmissable interstitial when signing raw hex the wallet can't decode
 - **`eth_sign` disabled by default** — the classic full-account-drain primitive; require an explicit advanced-settings opt-in
@@ -177,8 +167,6 @@ Updated: 17 Aug 2026
 ---
 
 ## Developer / DApp Compatibility
-
-### Your original list
 - More EIP-1193 compatibility methods
 - wallet_getCapabilities
 - wallet_sendCalls
@@ -190,8 +178,6 @@ Updated: 17 Aug 2026
 - DApp permission debugging page
 - RPC request logs for development
 - Demo dApp with connect/sign/send examples
-
-### Missing / Added
 - **`wallet_watchAsset` (EIP-747)** — dApp-initiated token add; extremely common and cheap to implement
 - **`wallet_requestPermissions` / `wallet_getPermissions` / `wallet_revokePermissions` (EIP-2255)**
 - **`wallet_switchEthereumChain` / `wallet_addEthereumChain`** — the provider-side counterpart to the UI above

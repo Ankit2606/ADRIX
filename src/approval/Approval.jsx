@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { formatEther } from 'ethers';
+import { formatEther, formatUnits } from 'ethers';
 import { call, shorten, trimAmount, accountColor } from '../lib/ui.js';
 import Unlock from '../popup/views/Unlock.jsx';
 
@@ -137,35 +137,25 @@ export default function Approval() {
   return (
     <div className="screen">
       <div className="scroll pad stack">
-        <div className="inline">
-          <span className="dot" />
-          <b>ADRIX</b>
-          {request.queued?.length > 1 && (
-            <span className="badge" style={{ marginLeft: 'auto' }}>
-              {request.queued.length} pending
-            </span>
-          )}
+        <div className="between">
+          <span className="inline">
+            <span className="dot" />
+            <b>ADRIX</b>
+          </span>
+          {request.queued?.length > 1 && <span className="badge accent">{request.queued.length} pending</span>}
         </div>
         <div className="beam" />
         <div className="eyebrow">Requested by</div>
-        <div className="mono" style={{ color: 'var(--accent)', wordBreak: 'break-all' }}>
-          {request.origin}
-        </div>
+        <div className="mono accent-text break">{request.origin}</div>
 
         {request.security?.isDomainFlagged && (
-          <div className="notice" style={{ background: '#3b0000', color: '#ff6b6b', border: '1px solid #ff6b6b' }}>
-            ⚠️ WARNING: This domain is flagged as a known scam or phishing site!
-          </div>
+          <div className="notice danger">⚠️ This domain is flagged as a known scam or phishing site.</div>
         )}
         {request.security?.isToAddressFlagged && (
-          <div className="notice" style={{ background: '#3b0000', color: '#ff6b6b', border: '1px solid #ff6b6b' }}>
-            ⚠️ WARNING: The target contract/address is flagged as malicious!
-          </div>
+          <div className="notice danger">⚠️ The target contract or address is flagged as malicious.</div>
         )}
         {request.security?.isSpenderFlagged && (
-          <div className="notice" style={{ background: '#3b0000', color: '#ff6b6b', border: '1px solid #ff6b6b' }}>
-            ⚠️ WARNING: The approved spender address is flagged as malicious!
-          </div>
+          <div className="notice danger">⚠️ The approved spender address is flagged as malicious.</div>
         )}
 
         {request.kind === 'connect' && (
@@ -242,13 +232,17 @@ function Connect({ accounts, chosen, setChosen, networks = {}, chainId, chosenNe
               type="checkbox"
               readOnly
               checked={chosen.includes(account.address)}
-              style={{ width: 16, height: 16, flex: 'none' }}
             />
             <span className="avatar" style={{ background: accountColor(account.address) }} />
             <div className="item-main">
               <span className="item-title">{account.name}</span>
               <span className="item-sub">{shorten(account.address, 8, 6)}</span>
             </div>
+            {/* A site can read a watch-only account but never get a signature
+                from it, which is worth knowing before granting access. */}
+            {account.type && account.type !== 'hd' && account.type !== 'imported' && (
+              <span className="badge">{account.type === 'watch' ? 'read only' : account.type}</span>
+            )}
           </button>
         ))}
       </div>
@@ -261,7 +255,6 @@ function Connect({ accounts, chosen, setChosen, networks = {}, chainId, chosenNe
               type="checkbox"
               readOnly
               checked={chosenNetworks.includes(network.chainId)}
-              style={{ width: 16, height: 16, flex: 'none' }}
             />
             <span
               className="dot"
@@ -311,19 +304,25 @@ function TypedSign({ request }) {
       <h1>{isPermit ? 'Token Approval (Permit)' : 'Sign structured data'}</h1>
       
       {isPermit && (
-        <div className="card" style={{ marginBottom: 12, border: '1px solid var(--accent)' }}>
-          <div className="eyebrow" style={{ color: 'var(--accent)' }}>Permit Signature Detected</div>
-          <p className="small">This signature allows a smart contract to spend your tokens without a separate transaction.</p>
-          <div className="between" style={{ marginTop: 8 }}>
-            <span className="small muted">Spender</span>
+        <div className="card accent">
+          <div className="eyebrow accent-text">Permit signature detected</div>
+          <p className="small">
+            This signature lets a contract spend your tokens without a separate approval transaction.
+          </p>
+          <div className="between">
+            <span className="small">Spender</span>
             <span className="mono small">{shorten(msg.spender, 10, 8)}</span>
           </div>
           <div className="between">
-            <span className="small muted">Value / Limit</span>
-            <span className="mono small">{msg.value === '115792089237316195423570985008687907853269984665640564039457584007913129639935' ? 'Unlimited' : msg.value}</span>
+            <span className="small">Value / limit</span>
+            <span className="mono small">
+              {msg.value === '115792089237316195423570985008687907853269984665640564039457584007913129639935'
+                ? 'Unlimited'
+                : msg.value}
+            </span>
           </div>
           <div className="between">
-            <span className="small muted">Token Contract</span>
+            <span className="small">Token contract</span>
             <span className="mono small">{shorten(request.domain?.verifyingContract, 10, 8)}</span>
           </div>
         </div>
@@ -338,12 +337,12 @@ function TypedSign({ request }) {
           <span className="small">Domain</span>
           <span className="mono small">{request.domain?.name ?? '--'}</span>
         </div>
-        <div className="eyebrow">Contents (Human-Readable)</div>
-        <div className="list" style={{ gap: 4 }}>
+        <div className="eyebrow">Contents</div>
+        <div>
           {Object.entries(msg).map(([key, value]) => (
-            <div key={key} className="between" style={{ padding: '4px 0', borderBottom: '1px solid var(--line)' }}>
-              <span className="small faint">{key}</span>
-              <span className="mono small" style={{ wordBreak: 'break-all', maxWidth: '70%', textAlign: 'right' }}>
+            <div key={key} className="kv">
+              <span className="kv-key">{key}</span>
+              <span className="kv-value" style={{ maxWidth: '68%' }}>
                 {typeof value === 'object' ? JSON.stringify(value) : String(value)}
               </span>
             </div>
@@ -409,62 +408,60 @@ function TransactionRequest({ request, preset, setPreset }) {
             ~{trimAmount(Number(value) + Number(fee?.estimatedFee ?? 0), 6)} {request.symbol}
           </span>
         </div>
-        {request.summary?.spender && (
-          <>
-            <div className="between">
-              <span className="small">{request.summary.operator ? 'Operator' : 'Spender'}</span>
-              <span className="mono small">{shorten(request.summary.spender, 8, 6)}</span>
-            </div>
-            {request.summary.amount && (
-              <div className="between">
-                <span className="small">Approval amount</span>
-                <span className="mono small">{request.summary.unlimited ? 'Unlimited' : request.summary.amount}</span>
-              </div>
-            )}
-            {request.summary.tokenId && (
-              <div className="between">
-                <span className="small">Token ID</span>
-                <span className="mono small">{request.summary.tokenId}</span>
-              </div>
-            )}
-          </>
+        {request.summary?.selector && (
+          <div className="between">
+            <span className="small">Selector</span>
+            <span className="mono small">{request.summary.selector}</span>
+          </div>
         )}
       </div>
 
-      <div className="card" style={{ marginTop: '14px' }}>
-        <div className="eyebrow" style={{ marginBottom: '8px' }}>Simulation & Balance Preview</div>
-        {gas?.estimateError ? (
-          <div className="mono small" style={{ color: 'var(--red)' }}>Simulation Failed: {gas.estimateError}</div>
-        ) : (
-          <div className="mono small" style={{ color: 'var(--green)' }}>Simulation: Success</div>
-        )}
-        
-        <div style={{ marginTop: '12px' }}>
-          {request.summary?.action === 'Token transfer' && (
-            <div className="between">
-              <span className="small">Expected Balance Change</span>
-              <span className="mono small" style={{ color: 'var(--red)' }}>-{request.summary.amount} (raw)</span>
-            </div>
-          )}
-          {!isContract && Number(value) > 0 && (
-            <div className="between">
-              <span className="small">Expected Balance Change</span>
-              <span className="mono small" style={{ color: 'var(--red)' }}>-{trimAmount(value)} {request.symbol}</span>
-            </div>
-          )}
-          {request.summary?.action === 'Token approval' && (
-            <div className="between">
-              <span className="small">New Allowance</span>
-              <span className="mono small">{request.summary.unlimited ? 'Unlimited' : request.summary.amount} (raw)</span>
-            </div>
-          )}
-          {request.summary?.action === 'Contract interaction' && (
-            <div className="between">
-              <span className="small">Expected Balance Change</span>
-              <span className="mono small" style={{ color: 'var(--red)' }}>-{trimAmount(value)} {request.symbol}</span>
-            </div>
-          )}
+      {request.summary?.spender && <ApprovalPanel summary={request.summary} context={request.approvalContext} />}
+      {request.summary?.namedArgs?.length > 0 && <DecodedArgs args={request.summary.namedArgs} />}
+      {request.summary?.risk && <div className="notice">{request.summary.risk}</div>}
+      {request.summary?.known === false && (
+        <div className="notice danger">
+          ADRIX does not recognise this method ({request.summary.selector}). It cannot tell you what this call does —
+          only approve it if you trust the site completely.
         </div>
+      )}
+
+      <div className="card">
+        <div className="between">
+          <span className="eyebrow">Gas estimate</span>
+          <span className={`badge ${gas?.estimateError ? 'failed' : 'confirmed'}`}>
+            {gas?.estimateError ? 'would revert' : 'passes'}
+          </span>
+        </div>
+        {gas?.estimateError && <div className="data-block">{gas.estimateError}</div>}
+
+        {request.summary?.action === 'Token transfer' && (
+          <div className="kv">
+            <span className="kv-key">Expected change</span>
+            <span className="kv-value" style={{ color: 'var(--danger)' }}>
+              -{request.summary.amount} (raw)
+            </span>
+          </div>
+        )}
+        {!isContract && Number(value) > 0 && (
+          <div className="kv">
+            <span className="kv-key">Expected change</span>
+            <span className="kv-value" style={{ color: 'var(--danger)' }}>
+              -{trimAmount(value)} {request.symbol}
+            </span>
+          </div>
+        )}
+        {request.summary?.action === 'Token approval' && (
+          <div className="kv">
+            <span className="kv-key">New allowance</span>
+            <span className="kv-value">
+              {request.summary.unlimited ? 'Unlimited' : `${request.summary.amount} (raw)`}
+            </span>
+          </div>
+        )}
+        <p className="small faint">
+          Based on <code>eth_estimateGas</code> only. ADRIX does not yet simulate full balance changes.
+        </p>
       </div>
 
       {gas && (
@@ -494,17 +491,132 @@ function TransactionRequest({ request, preset, setPreset }) {
         </div>
       )}
 
-      {request.summary?.spender && request.summary?.approved !== false && (
-        <div className="notice">
-          {request.summary.unlimited
-            ? 'This approves a very large token allowance. Only continue if you trust this site and contract.'
-            : request.summary.operator
-              ? 'This lets the operator move NFTs from this collection until you revoke it.'
-              : 'This grants token spending permission. Review the spender before continuing.'}
-        </div>
-      )}
     </>
   );
+}
+
+/**
+ * What an approve call actually changes. The raw calldata says only the new
+ * value; this pairs it with the allowance already in place, the token's real
+ * decimals, and whether the spender is even a contract.
+ */
+function ApprovalPanel({ summary, context }) {
+  const decimals = context?.decimals;
+  const symbol = context?.symbol ?? '';
+
+  const show = (raw) => {
+    if (raw == null) return '--';
+    if (summary.unlimited && raw === summary.amount) return 'Unlimited';
+    if (decimals == null) return `${raw} (raw)`;
+    try {
+      return `${trimAmount(formatUnits(raw, decimals), 6)} ${symbol}`.trim();
+    } catch {
+      return `${raw} (raw)`;
+    }
+  };
+
+  const revoking = summary.approved === false;
+
+  return (
+    <div className={`card ${revoking ? '' : 'accent'}`}>
+      <div className="between">
+        <span className="eyebrow accent-text">
+          {revoking ? 'Revoking approval' : summary.operator ? 'Operator approval' : 'Spending approval'}
+        </span>
+        {summary.unlimited && !revoking && <span className="badge failed">unlimited</span>}
+      </div>
+
+      <div className="kv">
+        <span className="kv-key">{summary.operator ? 'Operator' : 'Spender'}</span>
+        <span className="kv-value">{shorten(summary.spender, 10, 8)}</span>
+      </div>
+
+      {context?.spenderIsContract === false && <span className="badge failed">spender is a wallet, not a contract</span>}
+
+      {summary.tokenId && (
+        <div className="kv">
+          <span className="kv-key">Token ID</span>
+          <span className="kv-value">#{summary.tokenId}</span>
+        </div>
+      )}
+
+      {summary.amount != null && (
+        <>
+          <div className="kv">
+            <span className="kv-key">Current allowance</span>
+            <span className="kv-value">{context?.current != null ? show(context.current) : 'unknown'}</span>
+          </div>
+          <div className="kv">
+            <span className="kv-key">After this</span>
+            <span className="kv-value" style={{ color: summary.unlimited ? 'var(--danger)' : 'var(--text)' }}>
+              {show(summary.amount)}
+            </span>
+          </div>
+          {context?.direction && (
+            <div className="kv">
+              <span className="kv-key">Change</span>
+              <span
+                className="kv-value"
+                style={{ color: context.direction === 'increase' ? 'var(--warn)' : 'var(--good)' }}
+              >
+                {context.direction}
+              </span>
+            </div>
+          )}
+        </>
+      )}
+
+      {context?.warnings?.map((warning) => (
+        <div className="notice danger" key={warning}>
+          {warning}
+        </div>
+      ))}
+
+      {!revoking && (
+        <div className="notice">
+          {summary.unlimited
+            ? `This lets ${shorten(summary.spender)} move any amount of ${symbol || 'this token'}, at any time, until you revoke it.`
+            : summary.operator
+              ? 'This lets the operator move every NFT in this collection until you revoke it.'
+              : 'This grants spending permission that stays in place until revoked.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The decoded arguments, so a named method is not still an opaque call. */
+function DecodedArgs({ args }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="card">
+      <div className="between">
+        <span className="eyebrow">Decoded parameters</span>
+        <button className="link accent" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? 'hide' : `show ${args.length}`}
+        </button>
+      </div>
+      {open &&
+        args.map((arg, index) => (
+          <div className="kv" key={`${arg.name}-${index}`}>
+            <span className="kv-key">
+              {arg.name}
+              <span className="faint"> · {arg.type}</span>
+            </span>
+            <span className="kv-value" style={{ maxWidth: '62%' }}>
+              {formatArgValue(arg.value)}
+            </span>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+function formatArgValue(value) {
+  if (Array.isArray(value)) return value.length > 3 ? `[${value.length} items]` : value.join(', ');
+  const text = String(value ?? '');
+  return text.length > 66 ? `${text.slice(0, 30)}…${text.slice(-16)}` : text;
 }
 
 function ChainRequest({ request }) {

@@ -1,6 +1,7 @@
 import { Contract, Interface, ZeroAddress, getAddress, formatUnits, parseUnits } from 'ethers';
 import { local } from './storage.js';
 import { getProvider, getChainId } from './networks.js';
+import { decodeKnownCall, selectorOf } from './selectors.js';
 
 export const ERC20_ABI = [
   'function name() view returns (string)',
@@ -195,13 +196,41 @@ export async function unhideToken(address, chainId) {
   return all[chain][key];
 }
 
+export const ERC165_ABI = ['function supportsInterface(bytes4 interfaceId) view returns (bool)'];
+
+// EIP-165 interface identifiers.
+const IFACE_ERC721 = '0x80ac58cd';
+const IFACE_ERC1155 = '0xd9b67a26';
+const IFACE_ERC721_METADATA = '0x5b5e139f';
+
+/**
+ * Asks the contract what it is via EIP-165 rather than inferring the standard
+ * from whether ownerOf happens to throw. A burned or non-existent ERC-721 token
+ * makes ownerOf revert, which the old approach misread as "this is an ERC-1155".
+ */
+export async function detectNftStandard(contractAddress, provider) {
+  const probe = new Contract(contractAddress, ERC165_ABI, provider);
+  const [is721, is1155] = await Promise.all([
+    probe.supportsInterface(IFACE_ERC721).catch(() => null),
+    probe.supportsInterface(IFACE_ERC1155).catch(() => null),
+  ]);
+
+  if (is721 === true) return { standard: 'ERC721', declared: true };
+  if (is1155 === true) return { standard: 'ERC1155', declared: true };
+  // Some older collections predate EIP-165 or answer it incorrectly, so fall
+  // back to probing behaviour rather than refusing to track them.
+  return { standard: null, declared: false };
+}
+
 export async function lookupNft({ address, tokenId }, owner, chainId) {
   const chain = chainId ?? (await getChainId());
   const contractAddress = getAddress(address);
   const provider = await getProvider(chain);
 
-  const erc721 = new Contract(contractAddress, ERC721_ABI, provider);
-  try {
+  const { standard, declared } = await detectNftStandard(contractAddress, provider);
+
+  const readErc721 = async () => {
+    const erc721 = new Contract(contractAddress, ERC721_ABI, provider);
     const [name, symbol, tokenOwner, tokenUri] = await Promise.all([
       erc721.name().catch(() => ''),
       erc721.symbol().catch(() => ''),
@@ -210,6 +239,7 @@ export async function lookupNft({ address, tokenId }, owner, chainId) {
     ]);
     return {
       standard: 'ERC721',
+      declaredStandard: declared,
       address: contractAddress,
       tokenId: String(tokenId),
       name,
@@ -218,7 +248,9 @@ export async function lookupNft({ address, tokenId }, owner, chainId) {
       balance: owner && tokenOwner.toLowerCase() === owner.toLowerCase() ? '1' : '0',
       ...(await readNftMetadata(tokenUri, tokenId)),
     };
-  } catch {
+  };
+
+  const readErc1155 = async () => {
     const erc1155 = new Contract(contractAddress, ERC1155_ABI, provider);
     const [rawBalance, tokenUri] = await Promise.all([
       owner ? erc1155.balanceOf(owner, tokenId).catch(() => 0n) : Promise.resolve(0n),
@@ -226,6 +258,7 @@ export async function lookupNft({ address, tokenId }, owner, chainId) {
     ]);
     return {
       standard: 'ERC1155',
+      declaredStandard: declared,
       address: contractAddress,
       tokenId: String(tokenId),
       name: '',
@@ -233,6 +266,15 @@ export async function lookupNft({ address, tokenId }, owner, chainId) {
       balance: rawBalance.toString(),
       ...(await readNftMetadata(tokenUri, tokenId)),
     };
+  };
+
+  if (standard === 'ERC721') return readErc721();
+  if (standard === 'ERC1155') return readErc1155();
+
+  try {
+    return await readErc721();
+  } catch {
+    return readErc1155();
   }
 }
 
@@ -318,6 +360,88 @@ export async function tokenBalances(owner, chainId) {
 
 export function encodeTransfer(to, amount, decimals) {
   return erc20Interface.encodeFunctionData('transfer', [getAddress(to), parseUnits(String(amount), decimals)]);
+}
+
+/**
+ * Calldata for moving an NFT.
+ *
+ * safeTransferFrom is used rather than transferFrom because it calls
+ * onERC721Received on a contract recipient — a contract that cannot handle NFTs
+ * rejects the transfer instead of swallowing the token forever. That check is
+ * the entire reason the "safe" variant exists, and skipping it is how NFTs get
+ * permanently stranded in contracts.
+ */
+export function encodeNftTransfer({ standard, from, to, tokenId, amount = 1 }) {
+  const sender = getAddress(from);
+  const recipient = getAddress(to);
+  const id = BigInt(tokenId);
+
+  if (standard === 'ERC1155') {
+    const quantity = BigInt(amount);
+    if (quantity <= 0n) throw new Error('Enter a quantity of at least 1.');
+    return erc1155Interface.encodeFunctionData('safeTransferFrom', [sender, recipient, id, quantity, '0x']);
+  }
+
+  return erc721Interface.encodeFunctionData('safeTransferFrom(address,address,uint256)', [sender, recipient, id]);
+}
+
+/**
+ * Confirms the account can actually move this token before a transaction is
+ * built. Ownership can have changed since the list was last refreshed, and a
+ * transfer of a token you no longer hold reverts after costing gas.
+ */
+export async function checkNftTransferable({ address, tokenId, standard, owner, amount = 1 }, chainId) {
+  const chain = chainId ?? (await getChainId());
+  const provider = await getProvider(chain);
+  const contractAddress = getAddress(address);
+
+  if (standard === 'ERC1155') {
+    const contract = new Contract(contractAddress, ERC1155_ABI, provider);
+    const balance = await contract.balanceOf(owner, tokenId).catch(() => null);
+    if (balance == null) throw new Error('Could not read your balance for this token.');
+    if (balance <= 0n) throw new Error('This account does not hold that token any more.');
+    if (BigInt(amount) > balance) {
+      throw new Error(`You hold ${balance.toString()} of this token, not ${amount}.`);
+    }
+    return { ok: true, balance: balance.toString() };
+  }
+
+  const contract = new Contract(contractAddress, ERC721_ABI, provider);
+  const currentOwner = await contract.ownerOf(tokenId).catch(() => null);
+  if (!currentOwner) throw new Error('Could not read the owner of that token. It may have been burned.');
+  if (currentOwner.toLowerCase() !== owner.toLowerCase()) {
+    throw new Error(`That token is now owned by ${currentOwner.slice(0, 10)}…, not this account.`);
+  }
+  return { ok: true, owner: currentOwner, balance: '1' };
+}
+
+/**
+ * Whether a recipient contract can receive NFTs. Sending an ERC-721 to a
+ * contract that does not implement the receiver hook is the classic way to lose
+ * one permanently, so the send screen warns before it happens.
+ */
+export async function checkNftRecipient(to, chainId) {
+  const chain = chainId ?? (await getChainId());
+  const provider = await getProvider(chain);
+  const recipient = getAddress(to);
+
+  const code = await provider.getCode(recipient).catch(() => null);
+  if (code == null) return { isContract: null, canReceive: null };
+  if (code === '0x') return { isContract: false, canReceive: true };
+
+  // ERC721Receiver = 0x150b7a02, ERC1155Receiver = 0x4e2312e0
+  const probe = new Contract(recipient, ERC165_ABI, provider);
+  const [erc721, erc1155] = await Promise.all([
+    probe.supportsInterface('0x150b7a02').catch(() => null),
+    probe.supportsInterface('0x4e2312e0').catch(() => null),
+  ]);
+
+  return {
+    isContract: true,
+    // A contract that does not answer EIP-165 might still implement the hook,
+    // so an unknown answer is reported as unknown rather than as a refusal.
+    canReceive: erc721 === true || erc1155 === true ? true : erc721 === false && erc1155 === false ? false : null,
+  };
 }
 
 export async function recordApprovalFromTransaction({ chainId, owner, contract, data, hash, origin }) {
@@ -415,8 +539,18 @@ export function decodeErc20Call(data) {
   }
 }
 
+/**
+ * Identifies a contract call. Token standards are tried first because they
+ * carry approval semantics the confirmation screen needs; the wider selector
+ * registry covers swaps, permits, batches, and ownership calls.
+ *
+ * An unrecognised call still returns an object carrying the raw selector, so
+ * the UI can show "unknown method 0x1234abcd" — something the user can look up
+ * — instead of an anonymous "Contract interaction".
+ */
 export function decodeContractCall(data) {
   if (!data || data === '0x') return null;
+
   for (const [standard, iface] of [
     ['ERC20', erc20Interface],
     ['ERC721', erc721Interface],
@@ -430,15 +564,49 @@ export function decodeContractCall(data) {
         standard,
         name: parsed.name,
         signature: parsed.signature,
+        selector: selectorOf(data),
         args,
+        namedArgs: parsed.fragment.inputs.map((input, index) => ({
+          name: input.name || `arg${index}`,
+          type: input.type,
+          value: args[index],
+        })),
         label: methodLabel(standard, parsed.name, args),
         approval: approvalFromParsed(standard, parsed.name, args),
+        known: true,
       };
     } catch {
       /* try the next interface */
     }
   }
-  return null;
+
+  const known = decodeKnownCall(data);
+  if (known) {
+    return {
+      standard: known.group,
+      name: known.name,
+      signature: known.signature,
+      selector: known.selector,
+      args: known.args.map((arg) => arg.value),
+      namedArgs: known.args,
+      label: known.label,
+      risk: known.risk,
+      approval: null,
+      known: true,
+    };
+  }
+
+  return {
+    standard: null,
+    name: null,
+    signature: null,
+    selector: selectorOf(data),
+    args: [],
+    namedArgs: [],
+    label: 'Unrecognised contract call',
+    approval: null,
+    known: false,
+  };
 }
 
 function approvalFromParsed(standard, name, args) {
@@ -522,22 +690,66 @@ async function withLiveApprovalStatus(approval) {
   return active ? { ...approval, live: 'active', name } : { ...approval, live: 'revoked' };
 }
 
+const METADATA_TIMEOUT = 8000;
+const MAX_METADATA_BYTES = 512 * 1024;
+
+/**
+ * Reads token metadata. Third-party JSON is untrusted input, so the fetch is
+ * bounded by a timeout and a size cap, and only known fields are kept — the
+ * rest of the document is discarded rather than stored and rendered.
+ */
 async function readNftMetadata(uri, tokenId) {
   const url = normaliseMetadataUrl(uri, tokenId);
   if (!url) return { tokenUri: uri || '' };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), METADATA_TIMEOUT);
   try {
-    const response = await fetch(url);
-    const json = await response.json();
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return { tokenUri: uri || '', metadataUrl: url };
+
+    const length = Number(response.headers.get('content-length') ?? 0);
+    if (length > MAX_METADATA_BYTES) return { tokenUri: uri || '', metadataUrl: url };
+
+    const text = (await response.text()).slice(0, MAX_METADATA_BYTES);
+    const json = JSON.parse(text);
+
     return {
       tokenUri: uri || '',
       metadataUrl: url,
-      title: json.name ?? '',
-      description: json.description ?? '',
-      image: normaliseAssetUrl(json.image ?? json.image_url ?? ''),
+      title: clampText(json.name, 120),
+      description: clampText(json.description, 600),
+      image: normaliseAssetUrl(json.image ?? json.image_url ?? json.image_data ?? ''),
+      animationUrl: normaliseAssetUrl(json.animation_url ?? ''),
+      externalUrl: normaliseAssetUrl(json.external_url ?? ''),
+      traits: normaliseTraits(json.attributes ?? json.traits),
     };
   } catch {
     return { tokenUri: uri || '', metadataUrl: url };
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function clampText(value, max) {
+  return typeof value === 'string' ? value.slice(0, max) : '';
+}
+
+/** Accepts both the array-of-objects and plain-object trait conventions. */
+function normaliseTraits(attributes) {
+  if (!attributes) return [];
+
+  const rows = Array.isArray(attributes)
+    ? attributes.map((entry) => ({
+        type: clampText(entry?.trait_type ?? entry?.traitType ?? entry?.key ?? '', 40),
+        value: clampText(String(entry?.value ?? ''), 60),
+      }))
+    : Object.entries(attributes).map(([type, value]) => ({
+        type: clampText(type, 40),
+        value: clampText(String(value ?? ''), 60),
+      }));
+
+  return rows.filter((row) => row.type || row.value).slice(0, 24);
 }
 
 function normaliseMetadataUrl(uri, tokenId) {

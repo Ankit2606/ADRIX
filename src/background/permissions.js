@@ -25,13 +25,37 @@ async function record(origin, type, detail = {}) {
   await local.set({ connectionHistory: history.slice(0, HISTORY_LIMIT) });
 }
 
+/**
+ * Grants must be deduped and checked against the wallet before they are stored.
+ * Two entries for the same address make a dApp see the account twice, and an
+ * address that is not in the wallet is a grant that can never resolve.
+ */
+async function normaliseAccounts(accounts = []) {
+  const known = new Map(
+    (await listVisibleAccounts()).map((account) => [account.address.toLowerCase(), account.address])
+  );
+  const seen = new Set();
+  const result = [];
+  for (const address of accounts) {
+    const key = String(address ?? '').toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    // Store the wallet's checksummed form rather than whatever casing arrived.
+    if (known.has(key)) result.push(known.get(key));
+  }
+  return result;
+}
+
 export async function grant(origin, accounts, networks = []) {
   const permissions = await read();
   const previous = permissions[origin];
+  const allowedAccounts = await normaliseAccounts(accounts);
+  if (!allowedAccounts.length) throw Object.assign(new Error('No usable account was granted.'), { code: 4001 });
+
   const allowedNetworks = uniqueLower(networks.length ? networks : [await getChainId()]);
   const now = Date.now();
   permissions[origin] = {
-    accounts,
+    accounts: allowedAccounts,
     networks: allowedNetworks,
     connectedAt: previous?.connectedAt ?? now,
     updatedAt: now,
@@ -39,27 +63,29 @@ export async function grant(origin, accounts, networks = []) {
   };
   await write(permissions);
   await record(origin, previous ? 'updated' : 'connected', {
-    accounts,
+    accounts: allowedAccounts,
     networks: allowedNetworks,
   });
 }
 
 export async function updateAccounts(origin, accounts) {
   const permissions = await read();
-  if (!accounts.length) {
+  const allowedAccounts = await normaliseAccounts(accounts);
+
+  if (!allowedAccounts.length) {
     delete permissions[origin];
     await record(origin, 'disconnected');
   } else {
     const now = Date.now();
     permissions[origin] = {
       ...(permissions[origin] ?? {}),
-      accounts,
+      accounts: allowedAccounts,
       networks: permissions[origin]?.networks ?? [await getChainId()],
       connectedAt: permissions[origin]?.connectedAt ?? now,
       updatedAt: now,
       lastActiveAt: now,
     };
-    await record(origin, 'accountsUpdated', { accounts });
+    await record(origin, 'accountsUpdated', { accounts: allowedAccounts });
   }
   await write(permissions);
 }
@@ -178,12 +204,64 @@ export async function isPermitted(origin, address) {
 export async function purgeAccount(address) {
   const permissions = await read();
   for (const origin of Object.keys(permissions)) {
-    permissions[origin].accounts = permissions[origin].accounts.filter(
+    const remaining = (permissions[origin].accounts ?? []).filter(
       (a) => a.toLowerCase() !== address.toLowerCase()
     );
-    if (!permissions[origin].accounts.length) delete permissions[origin];
+    if (remaining.length) permissions[origin].accounts = remaining;
+    else delete permissions[origin];
   }
   await local.set({ permissions });
+}
+
+/** Drops every site grant at once. */
+export async function revokeAll() {
+  const permissions = await read();
+  const origins = Object.keys(permissions);
+  await local.set({ permissions: {} });
+  for (const origin of origins) await record(origin, 'disconnected');
+  return { revoked: origins.length, origins };
+}
+
+/**
+ * Everything one origin has done, newest first, plus a tally by type. This is
+ * what makes the history answer "what has this site actually been doing" rather
+ * than just "when did it connect".
+ */
+export async function siteActivity(origin) {
+  const history = await local.get('connectionHistory', []);
+  const entries = history.filter((entry) => entry.origin === origin);
+  const counts = {};
+  for (const entry of entries) counts[entry.type] = (counts[entry.type] ?? 0) + 1;
+  return {
+    origin,
+    entries,
+    counts,
+    signatures: (counts.personalSign ?? 0) + (counts.typedSign ?? 0),
+    transactions: counts.transaction ?? 0,
+    firstSeen: entries.length ? entries[entries.length - 1].at : null,
+    lastSeen: entries.length ? entries[0].at : null,
+  };
+}
+
+/** Distinct origins that appear in the history, including disconnected ones. */
+export async function listHistoryOrigins() {
+  const history = await local.get('connectionHistory', []);
+  const permissions = await read();
+  const seen = new Map();
+  for (const entry of history) {
+    const current = seen.get(entry.origin) ?? { origin: entry.origin, events: 0, lastSeen: 0 };
+    current.events += 1;
+    current.lastSeen = Math.max(current.lastSeen, entry.at ?? 0);
+    seen.set(entry.origin, current);
+  }
+  return [...seen.values()]
+    .map((row) => ({ ...row, connected: Boolean(permissions[row.origin]) }))
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+export async function clearHistory() {
+  await local.set({ connectionHistory: [] });
+  return { ok: true };
 }
 
 /** Drop a network from every site that had it - used when removing a custom network. */

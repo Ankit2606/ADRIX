@@ -80,7 +80,42 @@ export const DEFAULT_CHAIN = '0xaa36a7';
 
 export async function allNetworks() {
   const custom = await local.get('customNetworks', {});
-  return { ...BUILTIN_NETWORKS, ...custom };
+  // Built-ins can be edited too; overrides are stored separately so a reset
+  // restores the shipped defaults without needing them re-entered.
+  const overrides = await local.get('networkOverrides', {});
+  const merged = { ...BUILTIN_NETWORKS, ...custom };
+  for (const [chainId, patch] of Object.entries(overrides)) {
+    if (merged[chainId]) merged[chainId] = { ...merged[chainId], ...patch, edited: true };
+  }
+  return merged;
+}
+
+export function getShowTestnets() {
+  return local.get('showTestnets', true);
+}
+
+export async function setShowTestnets(value) {
+  await local.set({ showTestnets: Boolean(value) });
+  // Never strand the user on a hidden network.
+  if (!value) {
+    const current = await getChainId();
+    const networks = await allNetworks();
+    if (networks[current]?.testnet) {
+      const firstVisible = Object.values(networks).find((net) => !net.testnet);
+      if (firstVisible) await local.set({ chainId: firstVisible.chainId });
+    }
+  }
+  return Boolean(value);
+}
+
+/** allNetworks filtered by the testnet toggle. The selected chain always stays. */
+export async function visibleNetworks() {
+  const networks = await allNetworks();
+  if (await getShowTestnets()) return networks;
+  const current = await getChainId();
+  return Object.fromEntries(
+    Object.entries(networks).filter(([chainId, net]) => !net.testnet || chainId === current)
+  );
 }
 
 export async function getChainId() {
@@ -100,30 +135,101 @@ export async function setChain(chainId) {
   return networks[chainId];
 }
 
-export async function addNetwork(network) {
-  if (!/^0x[0-9a-f]+$/i.test(network.chainId)) throw new Error('Chain ID must be hex, like 0x1.');
-  if (!network.rpc?.startsWith('http')) throw new Error('RPC URL must start with http.');
+function validateNetworkInput(network) {
+  const chainId = normaliseChainId(network.chainId);
+  const name = String(network.name ?? '').trim();
+  if (!name) throw new Error('Enter a network name.');
 
-  const custom = await local.get('customNetworks', {});
-  custom[network.chainId.toLowerCase()] = {
-    chainId: network.chainId.toLowerCase(),
-    name: network.name,
-    rpc: network.rpc,
-    symbol: network.symbol || 'ETH',
+  const rpc = String(network.rpc ?? '').trim();
+  if (!/^https?:\/\//i.test(rpc)) throw new Error('RPC URL must start with http:// or https://.');
+
+  const explorer = String(network.explorer ?? '').trim();
+  if (explorer && !/^https?:\/\//i.test(explorer)) {
+    throw new Error('Block explorer URL must start with http:// or https://.');
+  }
+
+  return {
+    chainId,
+    name,
+    rpc,
+    symbol: String(network.symbol ?? '').trim() || 'ETH',
     decimals: 18,
-    explorer: network.explorer || '',
+    // Trailing slashes double up when explorer links are built, so drop them here.
+    explorer: explorer.replace(/\/+$/, ''),
     testnet: Boolean(network.testnet),
-    custom: true,
   };
+}
+
+export async function addNetwork(network) {
+  const clean = validateNetworkInput(network);
+  const custom = await local.get('customNetworks', {});
+  if (BUILTIN_NETWORKS[clean.chainId] || custom[clean.chainId]) {
+    throw new Error('That chain ID is already in the network list. Edit it instead.');
+  }
+
+  custom[clean.chainId] = { ...clean, custom: true };
   await local.set({ customNetworks: custom });
-  return custom[network.chainId.toLowerCase()];
+  providerCache.delete(clean.chainId);
+  return custom[clean.chainId];
+}
+
+/**
+ * Edits any network. Custom entries are rewritten in place; built-ins get an
+ * override record so the shipped default can be restored later. The chain ID
+ * itself is immutable — changing it would orphan every token, permission, and
+ * activity row keyed to it.
+ */
+export async function editNetwork(chainId, patch) {
+  const target = normaliseChainId(chainId);
+  const existing = (await allNetworks())[target];
+  if (!existing) throw new Error('Network not found.');
+
+  const clean = validateNetworkInput({ ...existing, ...patch, chainId: target });
+
+  if (BUILTIN_NETWORKS[target]) {
+    const overrides = await local.get('networkOverrides', {});
+    overrides[target] = {
+      name: clean.name,
+      rpc: clean.rpc,
+      symbol: clean.symbol,
+      explorer: clean.explorer,
+    };
+    await local.set({ networkOverrides: overrides });
+  } else {
+    const custom = await local.get('customNetworks', {});
+    custom[target] = { ...clean, custom: true };
+    await local.set({ customNetworks: custom });
+  }
+
+  // The cached provider is bound to the old RPC URL.
+  providerCache.delete(target);
+  healthCache.delete(target);
+  return (await allNetworks())[target];
+}
+
+/** Drops a built-in's override, restoring the shipped values. */
+export async function resetNetwork(chainId) {
+  const target = normaliseChainId(chainId);
+  if (!BUILTIN_NETWORKS[target]) throw new Error('Only built-in networks can be reset.');
+  const overrides = await local.get('networkOverrides', {});
+  delete overrides[target];
+  await local.set({ networkOverrides: overrides });
+  providerCache.delete(target);
+  healthCache.delete(target);
+  return BUILTIN_NETWORKS[target];
 }
 
 export async function removeNetwork(chainId) {
+  const target = normaliseChainId(chainId);
+  if (BUILTIN_NETWORKS[target]) throw new Error('Built-in networks cannot be removed, only edited.');
+
   const custom = await local.get('customNetworks', {});
-  delete custom[chainId];
+  if (!custom[target]) throw new Error('Network not found.');
+  delete custom[target];
   await local.set({ customNetworks: custom });
-  if ((await getChainId()) === chainId) await local.set({ chainId: DEFAULT_CHAIN });
+  providerCache.delete(target);
+  healthCache.delete(target);
+  if ((await getChainId()) === target) await local.set({ chainId: DEFAULT_CHAIN });
 }
 
 // Providers are cached per chain. `staticNetwork` stops ethers from
@@ -144,10 +250,28 @@ export async function getProvider(chainId) {
   return provider;
 }
 
-export async function getNetworkHealth(chainId) {
+/**
+ * Cached health only — never touches the network. getState() calls this on
+ * every state broadcast, and awaiting a live RPC round trip there would make
+ * the popup take up to six seconds to open on a slow endpoint.
+ */
+export async function peekNetworkHealth(chainId) {
   const network = await getNetwork(chainId);
   const cached = healthCache.get(network.chainId);
-  if (cached && cached.rpc === network.rpc && Date.now() - cached.checkedAt < HEALTH_TTL_MS) {
+  if (cached && cached.rpc === network.rpc) {
+    return { ...cached.health, stale: Date.now() - cached.checkedAt > HEALTH_TTL_MS };
+  }
+  return { status: 'unknown', latencyMs: null, blockNumber: null, checkedAt: null, stale: true };
+}
+
+/**
+ * Live probe. Measures round-trip latency and reads the head block plus current
+ * gas price, so "slow" can be backed by a number the user can see.
+ */
+export async function getNetworkHealth(chainId, { force = false } = {}) {
+  const network = await getNetwork(chainId);
+  const cached = healthCache.get(network.chainId);
+  if (!force && cached && cached.rpc === network.rpc && Date.now() - cached.checkedAt < HEALTH_TTL_MS) {
     return cached.health;
   }
 
@@ -157,11 +281,34 @@ export async function getNetworkHealth(chainId) {
     const started = Date.now();
     const blockNumber = await withTimeout(provider.getBlockNumber(), 6000, 'RPC timed out.');
     const latencyMs = Date.now() - started;
+
+    // Best-effort extras; a failure here should not downgrade a healthy result.
+    const [block, feeData] = await Promise.all([
+      withTimeout(provider.getBlock(blockNumber), 4000, 'block read timed out').catch(() => null),
+      withTimeout(provider.getFeeData(), 4000, 'fee read timed out').catch(() => null),
+    ]);
+
+    const blockAgeMs = block?.timestamp ? Date.now() - block.timestamp * 1000 : null;
+
     const health = {
-      status: latencyMs < 900 ? 'good' : latencyMs < 2500 ? 'slow' : 'poor',
+      // A node that answers fast but is behind is worse than a slow current
+      // one, so a stale head demotes the status regardless of latency.
+      status:
+        blockAgeMs != null && blockAgeMs > 180_000
+          ? 'poor'
+          : latencyMs < 900
+            ? 'good'
+            : latencyMs < 2500
+              ? 'slow'
+              : 'poor',
       latencyMs,
       blockNumber,
+      blockAgeMs,
+      baseFeePerGas: block?.baseFeePerGas?.toString() ?? null,
+      gasPrice: feeData?.gasPrice?.toString() ?? null,
+      rpcHost: hostOf(network.rpc),
       checkedAt,
+      stale: false,
     };
     healthCache.set(network.chainId, { rpc: network.rpc, checkedAt, health });
     return health;
@@ -170,7 +317,10 @@ export async function getNetworkHealth(chainId) {
       status: 'offline',
       latencyMs: null,
       blockNumber: null,
+      blockAgeMs: null,
+      rpcHost: hostOf(network.rpc),
       checkedAt,
+      stale: false,
       error: err.shortMessage ?? err.message,
     };
     healthCache.set(network.chainId, { rpc: network.rpc, checkedAt, health });
@@ -178,30 +328,145 @@ export async function getNetworkHealth(chainId) {
   }
 }
 
+/** Probes every visible network at once, for the network picker. */
+export async function checkAllNetworks() {
+  const networks = await visibleNetworks();
+  const entries = await Promise.all(
+    Object.values(networks).map(async (net) => [net.chainId, await getNetworkHealth(net.chainId)])
+  );
+  return Object.fromEntries(entries);
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url ?? '';
+  }
+}
+
+// Methods the wallet actually depends on. An endpoint that answers eth_chainId
+// but refuses eth_call looks fine at connect time and then breaks every balance
+// read, which is a much worse failure than being rejected up front.
+const REQUIRED_METHODS = [
+  { method: 'eth_getBalance', params: ['0x0000000000000000000000000000000000000000', 'latest'], label: 'read balances' },
+  { method: 'eth_call', params: [{ to: '0x0000000000000000000000000000000000000000', data: '0x' }, 'latest'], label: 'read contracts' },
+  { method: 'eth_estimateGas', params: [{ to: '0x0000000000000000000000000000000000000000', value: '0x0' }], label: 'estimate gas' },
+  { method: 'eth_getTransactionCount', params: ['0x0000000000000000000000000000000000000000', 'pending'], label: 'read nonces' },
+  { method: 'eth_gasPrice', params: [], label: 'read gas prices' },
+];
+
+/**
+ * Probes an endpoint before it is trusted with the user's addresses and
+ * signed transactions. Hard failures throw; everything survivable comes back
+ * as a warning so the user can decide.
+ */
 export async function testRpc(network) {
   const chainId = normaliseChainId(network.chainId);
-  if (!network.rpc?.startsWith('http')) throw new Error('RPC URL must start with http.');
+  const rpc = String(network.rpc ?? '').trim();
 
-  const provider = new JsonRpcProvider(network.rpc, Network.from(parseInt(chainId, 16)), {
-    staticNetwork: true,
-  });
+  let url;
+  try {
+    url = new URL(rpc);
+  } catch {
+    throw new Error('That is not a valid URL.');
+  }
+  if (!/^https?:$/.test(url.protocol)) {
+    throw new Error('RPC URL must use http:// or https://.');
+  }
+
+  const warnings = [];
+  const isLocal = ['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(url.hostname);
+
+  // Plain HTTP exposes every address you query and every signed transaction you
+  // broadcast to anything on the path. Tolerable for a local node, not for a
+  // remote one.
+  if (url.protocol === 'http:' && !isLocal) {
+    warnings.push('This endpoint is unencrypted HTTP. Your addresses and transactions travel in the clear.');
+  }
+  if (url.username || url.password) {
+    warnings.push('The URL embeds credentials. They are stored in the extension in plain text.');
+  }
+
+  // A URL already registered under a different chain is nearly always a paste
+  // error, and it silently produces a network that signs for the wrong chain.
+  const existing = await allNetworks();
+  const clash = Object.values(existing).find(
+    (net) => net.chainId !== chainId && net.rpc?.trim().toLowerCase() === rpc.toLowerCase()
+  );
+  if (clash) warnings.push(`This same URL is already used by "${clash.name}" (${clash.chainId}).`);
+
+  const provider = new JsonRpcProvider(rpc, Network.from(parseInt(chainId, 16)), { staticNetwork: true });
 
   const started = Date.now();
-  const [blockNumber, detected] = await Promise.all([
-    withTimeout(provider.getBlockNumber(), 7000, 'RPC timed out.'),
-    withTimeout(provider.send('eth_chainId', []), 7000, 'Could not read chain ID.'),
-  ]);
+  let blockNumber;
+  let detected;
+  try {
+    [blockNumber, detected] = await Promise.all([
+      withTimeout(provider.getBlockNumber(), 7000, 'RPC timed out reading the block number.'),
+      withTimeout(provider.send('eth_chainId', []), 7000, 'RPC did not answer eth_chainId.'),
+    ]);
+  } catch (err) {
+    throw new Error(`Could not reach that endpoint: ${err.shortMessage ?? err.message}`);
+  }
+  const latencyMs = Date.now() - started;
 
   const detectedHex = normaliseChainId(detected);
   if (detectedHex !== chainId) {
-    throw new Error(`RPC returned chain ${detectedHex}, but the form says ${chainId}.`);
+    const known = existing[detectedHex];
+    throw new Error(
+      `That endpoint serves chain ${detectedHex}${known ? ` (${known.name})` : ''}, not ${chainId}. ` +
+        'Signing against a mismatched chain ID produces transactions valid somewhere you did not intend.'
+    );
+  }
+
+  // Method support and head freshness, both best-effort.
+  const [methodResults, head, clientVersion] = await Promise.all([
+    Promise.all(
+      REQUIRED_METHODS.map(async ({ method, params, label }) => {
+        try {
+          await withTimeout(provider.send(method, params), 6000, 'timed out');
+          return { method, label, ok: true };
+        } catch (err) {
+          // A revert from eth_call still proves the method is served; only a
+          // "method not found" style failure counts as unsupported.
+          const message = String(err?.message ?? '');
+          const unsupported = /not (found|supported|available)|unsupported|-32601|does not exist/i.test(message);
+          return { method, label, ok: !unsupported, error: unsupported ? message : null };
+        }
+      })
+    ),
+    withTimeout(provider.getBlock(blockNumber), 6000, 'timed out').catch(() => null),
+    withTimeout(provider.send('web3_clientVersion', []), 4000, 'timed out').catch(() => null),
+  ]);
+
+  const missing = methodResults.filter((result) => !result.ok);
+  if (missing.length) {
+    warnings.push(`This endpoint cannot ${missing.map((m) => m.label).join(', ')}. The wallet needs those.`);
+  }
+
+  const blockAgeMs = head?.timestamp ? Date.now() - head.timestamp * 1000 : null;
+  if (blockAgeMs != null && blockAgeMs > 120_000) {
+    warnings.push(
+      `The latest block is ${Math.round(blockAgeMs / 60000)} minutes old. This node is lagging behind the chain.`
+    );
+  }
+  if (latencyMs > 2500) {
+    warnings.push(`Round trip took ${latencyMs}ms. Expect the wallet to feel slow on this endpoint.`);
   }
 
   return {
     ok: true,
     chainId,
+    rpc,
     blockNumber,
-    latencyMs: Date.now() - started,
+    latencyMs,
+    blockAgeMs,
+    supportsEip1559: head?.baseFeePerGas != null,
+    baseFeePerGas: head?.baseFeePerGas?.toString() ?? null,
+    clientVersion: typeof clientVersion === 'string' ? clientVersion.slice(0, 80) : null,
+    methods: methodResults,
+    warnings,
   };
 }
 
