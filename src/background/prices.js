@@ -68,8 +68,12 @@ const PLATFORM_IDS = {
   '0x38': 'binance-smart-chain',
 };
 
-const nativeCache = new Map(); // `${currency}` -> { at, prices: {coinId: number} }
-const tokenCache = new Map(); // `${chainId}:${currency}` -> { at, prices: {address: number} }
+const nativeCache = new Map(); // `${currency}` -> { at, quotes: {coinId: {price, change24h, updatedAt}} }
+const tokenCache = new Map(); // `${chainId}:${currency}` -> { at, prices: {address: number}, changes: {address: number} }
+
+// When a lookup last actually succeeded. Feeds the staleness notice — a price
+// that silently stops updating looks live, which is the failure worth naming.
+let lastSuccessAt = null;
 
 // The free tier allows only a handful of calls per minute, and the all-accounts
 // view asks about every chain at once. Two guards keep that inside the budget:
@@ -115,26 +119,45 @@ export function isRateLimited() {
  * has no traded native asset (testnets, local nodes) or the API is unreachable.
  */
 export async function nativePrice(chainId, currency) {
+  return (await nativeQuote(chainId, currency))?.price ?? null;
+}
+
+/**
+ * Full quote for a chain's native coin: price, 24h move, and when the source
+ * last updated it.
+ *
+ * The 24h change costs nothing extra on the same request and turns a number
+ * that just sits there into one that says something.
+ */
+export async function nativeQuote(chainId, currency) {
   const vs = currency ?? (await getCurrency());
   const coinId = NATIVE_IDS[chainId];
   if (!coinId) return null;
 
-  const key = vs;
-  const cached = nativeCache.get(key);
-  if (cached && Date.now() - cached.at < CACHE_TTL) return cached.prices[coinId] ?? null;
+  const cached = nativeCache.get(vs);
+  if (cached && Date.now() - cached.at < CACHE_TTL) return cached.quotes[coinId] ?? null;
 
   try {
     const ids = [...new Set(Object.values(NATIVE_IDS).filter(Boolean))].join(',');
-    const json = await getJson(`${API}/simple/price?ids=${ids}&vs_currencies=${vs}`);
-    const prices = {};
+    const json = await getJson(
+      `${API}/simple/price?ids=${ids}&vs_currencies=${vs}&include_24hr_change=true&include_last_updated_at=true`
+    );
+    const quotes = {};
     for (const [id, quote] of Object.entries(json)) {
-      if (typeof quote?.[vs] === 'number') prices[id] = quote[vs];
+      if (typeof quote?.[vs] !== 'number') continue;
+      quotes[id] = {
+        price: quote[vs],
+        change24h: typeof quote[`${vs}_24h_change`] === 'number' ? quote[`${vs}_24h_change`] : null,
+        updatedAt: quote.last_updated_at ? quote.last_updated_at * 1000 : null,
+      };
     }
-    nativeCache.set(key, { at: Date.now(), prices });
-    return prices[coinId] ?? null;
+    nativeCache.set(vs, { at: Date.now(), quotes });
+    lastSuccessAt = Date.now();
+    return quotes[coinId] ?? null;
   } catch {
-    // Serve a stale value rather than blanking the portfolio on a hiccup.
-    return cached?.prices[coinId] ?? null;
+    // Serve a stale value rather than blanking the portfolio on a hiccup. The
+    // UI is told separately that it is looking at stale data.
+    return cached?.quotes[coinId] ?? null;
   }
 }
 
@@ -160,19 +183,50 @@ export async function tokenPrices(chainId, addresses = [], currency) {
     // CoinGecko caps the contract list per request; 100 is comfortably inside it.
     const batch = wanted.slice(0, 100).join(',');
     const json = await getJson(
-      `${API}/simple/token_price/${platform}?contract_addresses=${batch}&vs_currencies=${vs}`
+      `${API}/simple/token_price/${platform}?contract_addresses=${batch}&vs_currencies=${vs}&include_24hr_change=true`
     );
     // Record every requested address, including misses, so the "covered" check
     // above does not re-request unknown tokens on every refresh.
     const prices = Object.fromEntries(wanted.map((address) => [address, null]));
+    const changes = {};
     for (const [address, quote] of Object.entries(json)) {
-      if (typeof quote?.[vs] === 'number') prices[address.toLowerCase()] = quote[vs];
+      if (typeof quote?.[vs] !== 'number') continue;
+      prices[address.toLowerCase()] = quote[vs];
+      if (typeof quote[`${vs}_24h_change`] === 'number') changes[address.toLowerCase()] = quote[`${vs}_24h_change`];
     }
-    tokenCache.set(key, { at: Date.now(), prices });
+    tokenCache.set(key, { at: Date.now(), prices, changes });
+    lastSuccessAt = Date.now();
     return prices;
   } catch {
     return cached?.prices ?? {};
   }
+}
+
+/** 24h moves for one chain's tokens, from whatever the last lookup cached. */
+export function tokenChanges(chainId, currency) {
+  return tokenCache.get(`${chainId}:${currency}`)?.changes ?? {};
+}
+
+/**
+ * Whether price data can be trusted right now.
+ *
+ * CoinGecko's free tier rate-limits hard, and the cache will happily serve
+ * hours-old numbers. The UI needs to be able to say so rather than presenting
+ * a stale figure as current.
+ */
+export function priceState() {
+  const freshest = Math.max(
+    0,
+    ...[...nativeCache.values(), ...tokenCache.values()].map((entry) => entry.at ?? 0)
+  );
+  return {
+    rateLimited: Date.now() < backoffUntil,
+    retryInMs: Math.max(0, backoffUntil - Date.now()),
+    lastSuccessAt,
+    cachedAt: freshest || null,
+    stale: freshest > 0 && Date.now() - freshest > CACHE_TTL,
+    source: 'CoinGecko',
+  };
 }
 
 // ---------------------------------------------------------------------------

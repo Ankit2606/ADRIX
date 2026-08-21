@@ -15,6 +15,7 @@ import Bridge from './views/Bridge.jsx';
 import Buy from './views/Buy.jsx';
 import BatchSend from './views/BatchSend.jsx';
 import Search from './views/Search.jsx';
+import SmartAccount from './views/SmartAccount.jsx';
 
 const VIEWS = {
   send: Send,
@@ -28,6 +29,7 @@ const VIEWS = {
   addToken: AddToken,
   settings: Settings,
   search: Search,
+  smartAccount: SmartAccount,
 };
 
 export default function App() {

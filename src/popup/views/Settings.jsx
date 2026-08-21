@@ -177,6 +177,12 @@ export default function Settings({ state, go, refresh }) {
           refresh={refresh}
         />
 
+        <NotificationSettings />
+
+        <SmartAccountSettings state={state} />
+
+        <PhishingProtection />
+
         <SignatureLog refresh={refresh} />
 
         <DappHistory
@@ -1178,6 +1184,497 @@ function ConnectedSite({ site, accounts, networks, currentChainId, open, onToggl
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * Notification preferences.
+ *
+ * Outgoing notifications came free — the wallet knows what it sent. Incoming
+ * ones are a poller over `eth_getLogs` against whatever endpoint is configured,
+ * which has real limits, so this states them rather than letting a user wonder
+ * why a transfer on another chain went unannounced.
+ */
+function NotificationSettings() {
+  const [status, setStatus] = useState(null);
+  const { busy, run } = useAsyncAction();
+
+  const load = async () => setStatus(await call('NOTIFICATION_PREFS'));
+
+  useEffect(() => {
+    load().catch(() => {});
+  }, []);
+
+  const update = (patch) =>
+    run(async () => {
+      await call('SET_NOTIFICATION_PREFS', { prefs: patch });
+      await load();
+    });
+
+  const prefs = status?.prefs;
+
+  return (
+    <section className="card">
+      <h2>Notifications</h2>
+
+      <label className="check-line">
+        <input
+          type="checkbox"
+          checked={Boolean(prefs?.enabled)}
+          onChange={(e) => update({ enabled: e.target.checked })}
+          disabled={busy || !prefs}
+        />
+        <span className="item-main">
+          <span>Desktop notifications</span>
+          <span className="small faint">Shown by the browser, even when the popup is closed.</span>
+        </span>
+      </label>
+
+      {prefs?.enabled && (
+        <>
+          <label className="check-line">
+            <input
+              type="checkbox"
+              checked={Boolean(prefs.outgoing)}
+              onChange={(e) => update({ outgoing: e.target.checked })}
+              disabled={busy}
+            />
+            <span className="item-main">
+              <span>Transactions you send</span>
+              <span className="small faint">When one is submitted and again when it settles.</span>
+            </span>
+          </label>
+
+          <label className="check-line">
+            <input
+              type="checkbox"
+              checked={Boolean(prefs.incoming)}
+              onChange={(e) => update({ incoming: e.target.checked })}
+              disabled={busy}
+            />
+            <span className="item-main">
+              <span>Funds arriving</span>
+              <span className="small faint">
+                Found by polling for transfer logs once a minute. ADRIX has no indexer, so this covers the selected
+                network only, and a rate-limited endpoint will delay it.
+              </span>
+            </span>
+          </label>
+
+          {prefs.incoming && (
+            <label className="check-line">
+              <input
+                type="checkbox"
+                checked={Boolean(prefs.ignoreSpam)}
+                onChange={(e) => update({ ignoreSpam: e.target.checked })}
+                disabled={busy}
+              />
+              <span className="item-main">
+                <span>Ignore untracked and spam tokens</span>
+                <span className="small faint">
+                  Airdropped junk arrives constantly. Without this, notifications become unreadable and get turned off.
+                </span>
+              </span>
+            </label>
+          )}
+
+          {status?.watching > 0 && (
+            <p className="small faint">
+              Watching {status.watching} account/network pair{status.watching === 1 ? '' : 's'}
+              {status.lastCheckedAt ? ` · last checked ${timeAgo(status.lastCheckedAt)}` : ''}.
+            </p>
+          )}
+
+          <div className="row2">
+            <button
+              className="ghost"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  await call('POLL_INCOMING');
+                  await load();
+                })
+              }
+            >
+              Check now
+            </button>
+            <button
+              className="ghost"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  await call('RESET_WATCH');
+                  await load();
+                })
+              }
+              title="Forget where the scan had reached"
+            >
+              Reset watermark
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Bundler and paymaster configuration.
+ *
+ * A user operation cannot be submitted without a bundler, and bundlers are
+ * third-party infrastructure. Public keyless ones are offered as defaults so
+ * the feature works out of the box, with the trade-off stated.
+ */
+function SmartAccountSettings({ state }) {
+  const [config, setConfig] = useState(null);
+  const [bundlerUrl, setBundlerUrl] = useState('');
+  const [paymasterUrl, setPaymasterUrl] = useState('');
+  const [test, setTest] = useState(null);
+  const [open, setOpen] = useState(false);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  const load = async () => {
+    const next = await call('AA_CONFIG', { chainId: state.chainId });
+    setConfig(next);
+    setBundlerUrl(next.bundlerUrl);
+    setPaymasterUrl(next.paymasterUrl);
+  };
+
+  useEffect(() => {
+    load().catch(() => {});
+    setTest(null);
+  }, [state.chainId]);
+
+  return (
+    <section className="card">
+      <div className="between">
+        <h2>Smart accounts</h2>
+        <button className="link" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? 'close' : 'configure'}
+        </button>
+      </div>
+
+      <p className="small">
+        ERC-4337 accounts submit user operations through a bundler rather than sending transactions directly. One is
+        required per network.
+      </p>
+
+      {config && (
+        <div className="kv">
+          <span className="kv-key">{state.network?.name}</span>
+          <span className="kv-value mono small">
+            {config.bundlerUrl ? new URL(config.bundlerUrl).host : 'not configured'}
+            {config.isDefault ? ' (public default)' : ''}
+          </span>
+        </div>
+      )}
+
+      {open && (
+        <div className="stack-sm">
+          <label className="field">
+            <span>Bundler URL</span>
+            <input
+              className="mono"
+              value={bundlerUrl}
+              onChange={(e) => {
+                setBundlerUrl(e.target.value);
+                setTest(null);
+                setError('');
+              }}
+              placeholder="https://…"
+              spellCheck="false"
+            />
+            <span className="small faint">
+              {config?.hasDefault
+                ? 'Leave empty to use the public default. Public bundlers are rate limited and see every operation you submit.'
+                : 'No public default for this network — a bundler URL is required.'}
+            </span>
+          </label>
+
+          <label className="field">
+            <span>Paymaster URL (optional)</span>
+            <input
+              className="mono"
+              value={paymasterUrl}
+              onChange={(e) => {
+                setPaymasterUrl(e.target.value);
+                setError('');
+              }}
+              placeholder="https://…"
+              spellCheck="false"
+            />
+            <span className="small faint">
+              An ERC-7677 endpoint that can sponsor gas. Sponsorship is always requested, never assumed — a refusal
+              just means the operation pays for itself.
+            </span>
+          </label>
+
+          {test && (
+            <div className="ok">
+              Reachable. EntryPoint v0.7 {test.supportsV07 ? 'supported' : 'NOT supported'}
+              {test.supportsV06 ? ', v0.6 also offered' : ''}.
+              {!test.supportsV07 && ' ADRIX only implements v0.7, so this bundler cannot be used.'}
+            </div>
+          )}
+          {error && <div className="error" role="alert">{error}</div>}
+
+          <div className="row2">
+            <button
+              className="ghost"
+              disabled={busy || !bundlerUrl.trim()}
+              onClick={() =>
+                run(async () => {
+                  setTest(await call('AA_TEST_BUNDLER', { url: bundlerUrl, chainId: state.chainId }));
+                })
+              }
+            >
+              {busy ? 'Testing…' : 'Test bundler'}
+            </button>
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  await call('AA_SET_CONFIG', { chainId: state.chainId, bundlerUrl, paymasterUrl });
+                  await load();
+                  setOpen(false);
+                })
+              }
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+const KNOWN_FEEDS = [
+  {
+    name: 'MetaMask eth-phishing-detect',
+    url: 'https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/master/src/config.json',
+    hint: 'The list most Ethereum wallets use. Tens of thousands of domains, updated continuously.',
+  },
+];
+
+/**
+ * Phishing and malicious-address protection.
+ *
+ * ADRIX detects impersonation on its own — a domain one character off
+ * uniswap.org is catchable without knowing that specific domain in advance,
+ * which is the fundamental weakness of blocklists. A community feed covers the
+ * rest, opt-in and with its source visible, because a stale list baked into the
+ * extension would be worse than an honest empty one.
+ */
+function PhishingProtection() {
+  const [lists, setLists] = useState(null);
+  const [url, setUrl] = useState('');
+  const [entry, setEntry] = useState('');
+  const [kind, setKind] = useState('domain');
+  const [open, setOpen] = useState(false);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  const load = async () => setLists(await call('GET_SECURITY_LISTS'));
+
+  useEffect(() => {
+    load().catch(() => {});
+  }, []);
+
+  const act = (type, payload) =>
+    run(async () => {
+      await call(type, payload);
+      await load();
+    });
+
+  const total =
+    (lists?.blockedDomains.length ?? 0) + (lists?.allowedDomains.length ?? 0) + (lists?.blockedAddresses.length ?? 0);
+  const feedEntries = lists?.feeds.reduce((sum, feed) => sum + feed.blocklistCount, 0) ?? 0;
+
+  return (
+    <section className="card">
+      <div className="between">
+        <h2>Phishing protection</h2>
+        <button className="link" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? 'close' : 'manage'}
+        </button>
+      </div>
+
+      <p className="small">
+        Every site that asks to connect or sign is checked for impersonation — character swaps, added hyphens, wrong
+        TLDs, and Unicode lookalikes of {'≈'}70 well-known dApps and explorers. Contracts are checked for being
+        deployed in the last day, which is the shape almost every drainer has.
+      </p>
+
+      <div className="stat-grid">
+        <div className="stat">
+          <span className="stat-value">{feedEntries.toLocaleString()}</span>
+          <span className="stat-label">Feed domains</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">{lists?.blockedDomains.length ?? 0}</span>
+          <span className="stat-label">You blocked</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">{lists?.allowedDomains.length ?? 0}</span>
+          <span className="stat-label">You trusted</span>
+        </div>
+        <div className="stat">
+          <span className="stat-value">{lists?.blockedAddresses.length ?? 0}</span>
+          <span className="stat-label">Blocked addresses</span>
+        </div>
+      </div>
+
+      {!lists?.feeds.length && (
+        <div className="notice">
+          No community feed imported. Impersonation detection works without one, but a feed adds the domains already
+          known to be malicious.
+        </div>
+      )}
+
+      {open && (
+        <div className="stack-sm">
+          <div className="eyebrow">Community feeds</div>
+          {lists?.feeds.map((feed) => (
+            <div className="item static" key={feed.url}>
+              <div className="item-main">
+                <span className="item-title">{feed.name}</span>
+                <span className="item-sub">
+                  {feed.blocklistCount.toLocaleString()} blocked · {feed.allowlistCount.toLocaleString()} allowed
+                </span>
+                <span className="item-sub faint">updated {timeAgo(feed.fetchedAt)}</span>
+              </div>
+              <div className="item-right">
+                <button
+                  className="link accent"
+                  disabled={busy}
+                  onClick={() => act('IMPORT_SECURITY_FEED', { url: feed.url, name: feed.name })}
+                >
+                  refresh
+                </button>
+                <button className="link" disabled={busy} onClick={() => act('REMOVE_SECURITY_FEED', { url: feed.url })}>
+                  remove
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {KNOWN_FEEDS.filter((known) => !lists?.feeds.some((feed) => feed.url === known.url)).map((known) => (
+            <div className="item static" key={known.url}>
+              <div className="item-main">
+                <span className="item-title">{known.name}</span>
+                <span className="item-sub">{known.hint}</span>
+              </div>
+              <button
+                className="link accent"
+                disabled={busy}
+                onClick={() => act('IMPORT_SECURITY_FEED', { url: known.url, name: known.name })}
+              >
+                {busy ? 'importing…' : 'import'}
+              </button>
+            </div>
+          ))}
+
+          <label className="field">
+            <span>Custom feed URL</span>
+            <div className="input-group">
+              <input
+                className="mono"
+                value={url}
+                onChange={(e) => {
+                  setUrl(e.target.value);
+                  setError('');
+                }}
+                placeholder="https://…/config.json"
+                spellCheck="false"
+              />
+              <button
+                className="ghost"
+                disabled={busy || !url.trim()}
+                onClick={() =>
+                  run(async () => {
+                    await call('IMPORT_SECURITY_FEED', { url });
+                    setUrl('');
+                    await load();
+                  })
+                }
+              >
+                Add
+              </button>
+            </div>
+            <span className="small faint">
+              eth-phishing-detect format, or a plain JSON array of hostnames. Must be https.
+            </span>
+          </label>
+
+          <div className="eyebrow">Your own entries</div>
+          <div className="input-group">
+            <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ maxWidth: 120 }}>
+              <option value="domain">Block site</option>
+              <option value="allow">Trust site</option>
+              <option value="address">Block address</option>
+            </select>
+            <input
+              className="mono"
+              value={entry}
+              onChange={(e) => {
+                setEntry(e.target.value);
+                setError('');
+              }}
+              placeholder={kind === 'address' ? '0x…' : 'example.com'}
+              spellCheck="false"
+            />
+            <button
+              className="ghost"
+              disabled={busy || !entry.trim()}
+              onClick={() =>
+                run(async () => {
+                  await call('ADD_SECURITY_ENTRY', { kind, value: entry });
+                  setEntry('');
+                  await load();
+                })
+              }
+            >
+              Add
+            </button>
+          </div>
+          <p className="small faint">
+            Trusting a site overrides every other check for it. ADRIX will get some of this wrong in both directions,
+            and you should have the last word.
+          </p>
+
+          {total > 0 && (
+            <div className="list">
+              {[
+                ['domain', lists.blockedDomains, 'blocked'],
+                ['allow', lists.allowedDomains, 'trusted'],
+                ['address', lists.blockedAddresses, 'blocked address'],
+              ].flatMap(([entryKind, values, label]) =>
+                values.map((value) => (
+                  <div className="item static compact" key={`${entryKind}:${value}`}>
+                    <div className="item-main">
+                      <span className="item-title mono small">{value}</span>
+                      <span className="item-sub">{label}</span>
+                    </div>
+                    <button
+                      className="link"
+                      disabled={busy}
+                      onClick={() => act('REMOVE_SECURITY_ENTRY', { kind: entryKind, value })}
+                    >
+                      remove
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {error && <div className="error" role="alert">{error}</div>}
+        </div>
+      )}
+    </section>
   );
 }
 

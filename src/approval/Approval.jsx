@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { formatEther, formatUnits } from 'ethers';
 import { call, shorten, trimAmount, accountColor } from '../lib/ui.js';
-import { BaseFeePanel, GasPresetGrid } from '../popup/components/common.jsx';
+import { BalanceChanges, BaseFeePanel, GasPresetGrid, SecurityBanner } from '../popup/components/common.jsx';
 import Unlock from '../popup/views/Unlock.jsx';
 
 const initialId = Number(new URLSearchParams(window.location.search).get('id'));
@@ -149,15 +149,7 @@ export default function Approval() {
         <div className="eyebrow">Requested by</div>
         <div className="mono accent-text break">{request.origin}</div>
 
-        {request.security?.isDomainFlagged && (
-          <div className="notice danger">⚠️ This domain is flagged as a known scam or phishing site.</div>
-        )}
-        {request.security?.isToAddressFlagged && (
-          <div className="notice danger">⚠️ The target contract or address is flagged as malicious.</div>
-        )}
-        {request.security?.isSpenderFlagged && (
-          <div className="notice danger">⚠️ The approved spender address is flagged as malicious.</div>
-        )}
+        <SecurityBanner security={request.security} />
 
         {request.kind === 'connect' && (
           <Connect
@@ -296,65 +288,189 @@ function PersonalSign({ request }) {
   );
 }
 
+/**
+ * Typed data, parsed rather than dumped.
+ *
+ * The old version printed the raw message object. This leads with what the
+ * payload *is*, then the grant it makes if it is a permit, then every field
+ * rendered in its own units — with the raw JSON still reachable, because a
+ * parser that hides the source is asking for trust it has not earned.
+ */
 function TypedSign({ request }) {
-  const isPermit = request.primaryType === 'Permit';
-  const msg = request.message || {};
+  const parsed = request.parsed;
+  const permit = request.permit;
+  const [showRaw, setShowRaw] = useState(false);
+
+  // Without a parse there is nothing to improve on, so fall back to the source.
+  if (!parsed) {
+    return (
+      <>
+        <h1>Sign structured data</h1>
+        <div className="card">
+          <div className="eyebrow">Payload</div>
+          <div className="data-block">{JSON.stringify(request.message, null, 2)}</div>
+        </div>
+      </>
+    );
+  }
+
+  const kind = parsed.schema.kind;
 
   return (
     <>
-      <h1>{isPermit ? 'Token Approval (Permit)' : 'Sign structured data'}</h1>
-      
-      {isPermit && (
-        <div className="card accent">
-          <div className="eyebrow accent-text">Permit signature detected</div>
-          <p className="small">
-            This signature lets a contract spend your tokens without a separate approval transaction.
-          </p>
+      <h1>{parsed.schema.label}</h1>
+      {parsed.schema.summary && <p className="small">{parsed.schema.summary}</p>}
+
+      {/* The grant, first and in plain terms. Everything below is detail. */}
+      {permit && (
+        <div className={`card ${permit.unlimited ? '' : 'accent'}`}>
           <div className="between">
-            <span className="small">Spender</span>
-            <span className="mono small">{shorten(msg.spender, 10, 8)}</span>
+            <span className="eyebrow accent-text">What this permits</span>
+            {permit.unlimited && <span className="badge failed">unlimited</span>}
           </div>
-          <div className="between">
-            <span className="small">Value / limit</span>
-            <span className="mono small">
-              {msg.value === '115792089237316195423570985008687907853269984665640564039457584007913129639935'
+
+          <div className="kv">
+            <span className="kv-key">Spender</span>
+            <span className="kv-value mono">{shorten(permit.spender, 10, 8)}</span>
+          </div>
+          <div className="kv">
+            <span className="kv-key">Amount</span>
+            <span className="kv-value" style={{ color: permit.unlimited ? 'var(--danger)' : 'var(--text)' }}>
+              {permit.unlimited
                 ? 'Unlimited'
-                : msg.value}
+                : permit.amount != null && parsed.domain.verifyingContract
+                  ? (findField(parsed.fields, /amount|value/i)?.display ?? permit.amount)
+                  : (permit.amount ?? '--')}
             </span>
           </div>
-          <div className="between">
-            <span className="small">Token contract</span>
-            <span className="mono small">{shorten(request.domain?.verifyingContract, 10, 8)}</span>
+          <div className="kv">
+            <span className="kv-key">Expires</span>
+            <span className="kv-value">{findField(parsed.fields, /deadline|expir/i)?.display ?? 'not stated'}</span>
           </div>
+          {permit.batch && (
+            <div className="kv">
+              <span className="kv-key">Covers</span>
+              <span className="kv-value">{permit.batchCount} tokens in one signature</span>
+            </div>
+          )}
+
+          {request.spenderScreen?.reasons?.length > 0 && (
+            <div className="notice danger">
+              {request.spenderScreen.reasons.map((reason) => (
+                <div key={reason}>{reason}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
+      {parsed.domain.checks.map((check) => (
+        <div className={check.level === 'danger' ? 'notice danger' : 'notice'} key={check.message} role="alert">
+          {check.message}
+        </div>
+      ))}
+
+      {parsed.warnings.map((warning, index) => (
+        <div
+          className={warning.level === 'danger' ? 'notice danger' : warning.level === 'warn' ? 'notice' : 'notice info'}
+          key={`${warning.message}-${index}`}
+        >
+          {warning.message}
+        </div>
+      ))}
+
+      <div className="card">
+        <div className="eyebrow">Contents</div>
+        <FieldTree nodes={parsed.fields} />
+      </div>
+
       <div className="card">
         <div className="between">
-          <span className="small">Type</span>
-          <span className="mono small">{request.primaryType}</span>
+          <span className="eyebrow">Signing for</span>
+          <button className="link accent" onClick={() => setShowRaw(!showRaw)} aria-expanded={showRaw}>
+            {showRaw ? 'hide raw' : 'show raw'}
+          </button>
         </div>
-        <div className="between">
-          <span className="small">Domain</span>
-          <span className="mono small">{request.domain?.name ?? '--'}</span>
+        <div className="kv">
+          <span className="kv-key">Contract</span>
+          <span className="kv-value mono">
+            {parsed.domain.verifyingContract ? shorten(parsed.domain.verifyingContract, 10, 8) : 'not specified'}
+          </span>
         </div>
-        <div className="eyebrow">Contents</div>
-        <div>
-          {Object.entries(msg).map(([key, value]) => (
-            <div key={key} className="kv">
-              <span className="kv-key">{key}</span>
-              <span className="kv-value" style={{ maxWidth: '68%' }}>
-                {typeof value === 'object' ? JSON.stringify(value) : String(value)}
-              </span>
-            </div>
-          ))}
+        <div className="kv">
+          <span className="kv-key">Chain</span>
+          <span className="kv-value mono">{parsed.domain.chainId ?? 'not specified'}</span>
         </div>
+        <div className="kv">
+          <span className="kv-key">Schema</span>
+          <span className="kv-value mono">
+            {parsed.domain.name ?? '--'}
+            {parsed.domain.version ? ` v${parsed.domain.version}` : ''} · {parsed.primaryType}
+          </span>
+        </div>
+
+        {showRaw && (
+          <>
+            {/* The exact hash being signed, so a careful user can compare it
+                against whatever the site claims it is asking for. */}
+            {parsed.digest && (
+              <>
+                <span className="small faint">EIP-712 digest</span>
+                <div className="data-block">{parsed.digest}</div>
+              </>
+            )}
+            <span className="small faint">Raw payload</span>
+            <div className="data-block">{JSON.stringify(request.message, null, 2)}</div>
+          </>
+        )}
       </div>
-      <div className="notice">
-        Signatures can authorise actions. Only sign messages you asked a site to produce.
-      </div>
+
+      {kind !== 'permit' && kind !== 'order' && (
+        <div className="notice">
+          Signatures can authorise actions without spending gas. Only sign what you asked the site to produce.
+        </div>
+      )}
     </>
   );
+}
+
+/** Depth-first render of the parsed field tree, structs and arrays included. */
+function FieldTree({ nodes, depth = 0 }) {
+  return nodes.map((node) => (
+    <div key={node.path} className={depth ? 'field-nested' : ''}>
+      <div className="kv">
+        <span className="kv-key">
+          {node.name}
+          <span className="faint"> · {node.type}</span>
+        </span>
+        <span
+          className="kv-value"
+          style={{
+            maxWidth: '62%',
+            color:
+              node.level === 'danger' ? 'var(--danger)' : node.level === 'warn' ? 'var(--warn)' : undefined,
+          }}
+        >
+          {node.display}
+        </span>
+      </div>
+      {node.note && <div className="field-note small">{node.note}</div>}
+      {node.children?.length > 0 && <FieldTree nodes={node.children} depth={depth + 1} />}
+      {node.truncatedItems > 0 && <div className="field-note small">+{node.truncatedItems} more not shown</div>}
+    </div>
+  ));
+}
+
+/** First field whose name matches, at any depth. */
+function findField(nodes, pattern) {
+  for (const node of nodes) {
+    if (pattern.test(node.name)) return node;
+    if (node.children) {
+      const found = findField(node.children, pattern);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 function TransactionRequest({ request, preset, setPreset }) {
@@ -438,43 +554,25 @@ function TransactionRequest({ request, preset, setPreset }) {
         </div>
       )}
 
-      <div className="card">
-        <div className="between">
-          <span className="eyebrow">Gas estimate</span>
-          <span className={`badge ${gas?.estimateError ? 'failed' : 'confirmed'}`}>
-            {gas?.estimateError ? 'would revert' : 'passes'}
-          </span>
-        </div>
-        {gas?.estimateError && <div className="data-block">{gas.estimateError}</div>}
+      {/* The simulated outcome, ahead of the fee controls: what this moves is a
+          more important question than what it costs. */}
+      <BalanceChanges simulation={request.simulation} symbol={request.symbol} />
 
-        {request.summary?.action === 'Token transfer' && (
-          <div className="kv">
-            <span className="kv-key">Expected change</span>
-            <span className="kv-value" style={{ color: 'var(--danger)' }}>
-              -{request.summary.amount} (raw)
+      {!request.simulation && (
+        <div className="card">
+          <div className="between">
+            <span className="eyebrow">Gas estimate</span>
+            <span className={`badge ${gas?.estimateError ? 'failed' : 'confirmed'}`}>
+              {gas?.estimateError ? 'would revert' : 'passes'}
             </span>
           </div>
-        )}
-        {!isContract && Number(value) > 0 && (
-          <div className="kv">
-            <span className="kv-key">Expected change</span>
-            <span className="kv-value" style={{ color: 'var(--danger)' }}>
-              -{trimAmount(value)} {request.symbol}
-            </span>
-          </div>
-        )}
-        {request.summary?.action === 'Token approval' && (
-          <div className="kv">
-            <span className="kv-key">New allowance</span>
-            <span className="kv-value">
-              {request.summary.unlimited ? 'Unlimited' : `${request.summary.amount} (raw)`}
-            </span>
-          </div>
-        )}
-        <p className="small faint">
-          Based on <code>eth_estimateGas</code> only. ADRIX does not yet simulate full balance changes.
-        </p>
-      </div>
+          {gas?.estimateError && <div className="data-block">{gas.estimateError}</div>}
+          <p className="small faint">
+            Simulation was unavailable, so this is an <code>eth_estimateGas</code> result only — it shows whether the
+            transaction reverts, not what it moves.
+          </p>
+        </div>
+      )}
 
       {gas && (
         <>

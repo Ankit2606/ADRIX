@@ -21,6 +21,7 @@ import {
   BaseFeePanel,
   GasPresetGrid,
   NonceGapWarning,
+  BalanceChanges,
 } from '../components/common.jsx';
 
 export default function Send({ state, go }) {
@@ -52,6 +53,7 @@ export default function Send({ state, go }) {
   // a stale Max amount is how a send-all silently exceeds the balance.
   const [maxMode, setMaxMode] = useState(false);
   const [nonceInfo, setNonceInfo] = useState(null);
+  const [simulation, setSimulation] = useState(null);
 
   const { busy, error, setError, run } = useAsyncAction();
   const selectedAccount = state.accounts.find((account) => account.address === state.selected);
@@ -296,7 +298,14 @@ export default function Send({ state, go }) {
           }
         : { from: state.selected, to: address, value: '0x' + parseEther(value).toString(16), data: '0x' };
 
-      applyGasInfo(await call('ESTIMATE_GAS', { request }));
+      // Simulated alongside the estimate rather than after it, so the review
+      // screen never renders with a hole where the balance changes go.
+      const [gas, sim] = await Promise.all([
+        call('ESTIMATE_GAS', { request }),
+        call('SIMULATE', { request }).catch(() => null),
+      ]);
+      applyGasInfo(gas);
+      setSimulation(sim);
       setStep('review');
     });
 
@@ -417,6 +426,20 @@ export default function Send({ state, go }) {
                   This is a watch-only account. ADRIX can show its balance but cannot sign for it.
                 </div>
               )}
+              {/* A contract account does not sign transactions — a Safe gathers
+                  owner signatures and a 4337 account emits a user operation.
+                  Sending them down this flow would fail at the signing step. */}
+              {(selectedAccount?.type === 'smart' || selectedAccount?.type === 'multisig') && (
+                <div className="notice">
+                  This is a contract account, so it does not send transactions directly.
+                  <button
+                    className="link accent"
+                    onClick={() => go('smartAccount', { address: selectedAccount.address })}
+                  >
+                    Open its own screen
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="stack-sm">
@@ -509,7 +532,11 @@ export default function Send({ state, go }) {
             <button
               className="primary"
               onClick={() => setStep('amount')}
-              disabled={!recipient || inspection?.state === 'invalid' || selectedAccount?.type === 'watch'}
+              disabled={
+                !recipient ||
+                inspection?.state === 'invalid' ||
+                ['watch', 'smart', 'multisig', 'hardware'].includes(selectedAccount?.type)
+              }
             >
               Continue
             </button>
@@ -689,6 +716,8 @@ export default function Send({ state, go }) {
               </div>
             )}
           </div>
+
+          <BalanceChanges simulation={simulation} symbol={portfolio?.native?.symbol} />
 
           <RecipientWarnings inspection={inspection} token={token} symbol={symbol} />
 

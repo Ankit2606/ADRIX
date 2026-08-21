@@ -69,13 +69,25 @@ export default function Accounts({ state, go, refresh }) {
                   {account.type !== 'hd' && <span className="badge">{account.type}</span>}
                 </span>
               </button>
-              <button
-                className="link item-aside"
-                onClick={() => setPanel(account.address)}
-                aria-label={`Manage ${account.name}`}
-              >
-                manage
-              </button>
+              {/* A contract account's useful screen is its own — owners and a
+                  signing queue, not a rename box. */}
+              {account.type === 'smart' || account.type === 'multisig' ? (
+                <button
+                  className="link item-aside"
+                  onClick={() => go('smartAccount', { address: account.address })}
+                  aria-label={`Open ${account.name}`}
+                >
+                  open
+                </button>
+              ) : (
+                <button
+                  className="link item-aside"
+                  onClick={() => setPanel(account.address)}
+                  aria-label={`Manage ${account.name}`}
+                >
+                  manage
+                </button>
+              )}
             </div>
           ))}
           {needle && !visible.length && <EmptyState icon="⌕" title="No match" body="No account matches that search." />}
@@ -394,13 +406,17 @@ const ADDRESS_ONLY_COPY = {
   },
   smart: {
     title: 'Add a smart account',
-    note: 'Tracked as an address only. Dispatching user operations needs an ERC-4337 bundler, which is not built yet.',
+    note: 'An ERC-4337 account. ADRIX will read the contract to find its EntryPoint and owner, and check whether it holds a key that can sign for it.',
     message: 'ADD_SMART_ACCOUNT',
+    // Validated on the chain before it is stored, rather than accepting any
+    // address and failing later.
+    probe: 'AA_INSPECT',
   },
   multisig: {
-    title: 'Add a multisig account',
-    note: 'Tracked as an address only. Collecting co-owner signatures is not implemented yet.',
+    title: 'Add a Safe',
+    note: 'ADRIX will read the Safe to find its owners and threshold, and check which of them you hold keys for.',
     message: 'ADD_MULTISIG_ACCOUNT',
+    probe: 'SAFE_INSPECT',
   },
 };
 
@@ -409,7 +425,20 @@ function AddressOnlyPanel({ type, onClose, refresh }) {
   const [address, setAddress] = useState('');
   const [name, setName] = useState('');
   const [vendor, setVendor] = useState('ledger');
-  const { busy, error, run } = useAsyncAction();
+  const [probe, setProbe] = useState(null);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  // Reading the contract before storing it turns "add an address" into "confirm
+  // this is the account you think it is" — the owners and threshold are the
+  // whole point of adding a Safe, and finding them absent later is too late.
+  const inspect = () =>
+    run(async () => {
+      setProbe(null);
+      const { address: resolved } = await call('RESOLVE_RECIPIENT', { input: address });
+      const result = await call(copy.probe, { address: resolved });
+      if (copy.probe === 'SAFE_INSPECT' && !result.isSafe) throw new Error(result.reason);
+      setProbe({ ...result, resolved });
+    });
 
   return (
     <div className="card">
@@ -446,26 +475,83 @@ function AddressOnlyPanel({ type, onClose, refresh }) {
       </label>
 
       <div className="notice">{copy.note}</div>
+
+      {probe && (
+        <div className="card">
+          <span className="eyebrow">What ADRIX found</span>
+          {probe.isSafe ? (
+            <>
+              <div className="kv">
+                <span className="kv-key">Safe version</span>
+                <span className="kv-value">{probe.version}</span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Signatures needed</span>
+                <span className="kv-value">
+                  {probe.threshold} of {probe.owners.length} owners
+                </span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Owner keys you hold</span>
+                <span className="kv-value">
+                  {probe.localOwners.length
+                    ? probe.localOwners.map((owner) => owner.name).join(', ')
+                    : 'none — watch only'}
+                </span>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="kv">
+                <span className="kv-key">Deployed</span>
+                <span className="kv-value">{probe.deployed ? 'yes' : 'no'}</span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">EntryPoint</span>
+                <span className="kv-value mono small">
+                  {probe.entryPoint ? shorten(probe.entryPoint, 8, 6) : 'not reported'}
+                </span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Signing key</span>
+                <span className="kv-value">{probe.signer ? probe.signer.name : 'none held here'}</span>
+              </div>
+            </>
+          )}
+          {(probe.notes ?? []).map((note) => (
+            <div className="notice" key={note}>
+              {note}
+            </div>
+          ))}
+        </div>
+      )}
+
       {error && <div className="error" role="alert">{error}</div>}
       <div className="row2">
         <button className="ghost" onClick={onClose}>
           Cancel
         </button>
-        <button
-          className="primary"
-          disabled={busy || !address}
-          onClick={() =>
-            run(async () => {
-              // Accepts an ENS name too, resolved before the account is stored.
-              const { address: resolved } = await call('RESOLVE_RECIPIENT', { input: address });
-              await call(copy.message, { address: resolved, name, vendor });
-              await refresh();
-              onClose();
-            })
-          }
-        >
-          {busy ? 'Adding…' : 'Add'}
-        </button>
+        {copy.probe && !probe ? (
+          <button className="primary" disabled={busy || !address} onClick={inspect}>
+            {busy ? 'Reading…' : 'Check address'}
+          </button>
+        ) : (
+          <button
+            className="primary"
+            disabled={busy || !address}
+            onClick={() =>
+              run(async () => {
+                // Accepts an ENS name too, resolved before the account is stored.
+                const resolved = probe?.resolved ?? (await call('RESOLVE_RECIPIENT', { input: address })).address;
+                await call(copy.message, { address: resolved, name, vendor });
+                await refresh();
+                onClose();
+              })
+            }
+          >
+            {busy ? 'Adding…' : 'Add'}
+          </button>
+        )}
       </div>
     </div>
   );

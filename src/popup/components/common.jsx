@@ -497,6 +497,171 @@ function trimFee(value) {
   return number.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
+// ---------------------------------------------------------------------------
+// Simulation
+// ---------------------------------------------------------------------------
+
+/**
+ * What a transaction will actually move.
+ *
+ * The honesty rules here matter more than the layout. A simulation that could
+ * not see token movement must not render as "no changes" — that reads as
+ * "nothing leaves your wallet", which is the exact opposite of what an
+ * incomplete result means. So an incomplete simulation says so, in place of the
+ * list, and a failed one says that too.
+ */
+export function BalanceChanges({ simulation, symbol }) {
+  if (!simulation) return null;
+
+  if (simulation.reverted) {
+    return (
+      <div className="notice danger">
+        <b>This transaction will fail.</b>
+        <p className="small">
+          {simulation.revertReason ?? 'It reverted during simulation.'} Sending it anyway costs the gas fee and
+          changes nothing.
+        </p>
+      </div>
+    );
+  }
+
+  const changes = simulation.changes ?? [];
+  const approvals = simulation.approvals ?? [];
+
+  return (
+    <div className="card sim">
+      <div className="between">
+        <span className="eyebrow">Balance changes</span>
+        <span className={`badge ${simulation.complete ? 'confirmed' : 'pending'}`}>
+          {simulation.complete ? 'simulated' : 'partial'}
+        </span>
+      </div>
+
+      {!simulation.complete ? (
+        <div className="notice">
+          {simulation.incompleteReason ??
+            'ADRIX could not fully simulate this transaction on this endpoint, so the changes below may be incomplete.'}
+        </div>
+      ) : changes.length === 0 && approvals.length === 0 ? (
+        <p className="small">
+          Nothing moves out of or into this account. The transaction still does something on chain — it just does not
+          transfer any asset you hold.
+        </p>
+      ) : null}
+
+      {changes.map((change, index) => (
+        <div className={`sim-row ${change.direction}`} key={`${change.standard}-${change.contract}-${index}`}>
+          <span className="sim-sign" aria-hidden="true">
+            {change.direction === 'out' ? '−' : '+'}
+          </span>
+          <div className="item-main">
+            <span className="sim-amount">
+              {change.standard === 'ERC721' || change.standard === 'ERC1155'
+                ? `${change.amount} × #${change.tokenId}`
+                : (change.amount ?? `${change.raw} (raw)`)}{' '}
+              <span className="sim-symbol">
+                {change.symbol ?? (change.standard === 'NATIVE' ? symbol : shorten(change.contract, 6, 4))}
+              </span>
+            </span>
+            <span className="item-sub">
+              {change.direction === 'out' ? 'leaves this account' : 'arrives in this account'}
+              {change.counterparty ? ` · ${shorten(change.counterparty, 6, 4)}` : ''}
+            </span>
+            {/* An unrecognised token in a simulation is worth flagging: it is
+                often the payout leg of a scam that hands over a worthless
+                token in exchange for a real one. */}
+            {change.standard === 'ERC20' && change.known === false && (
+              <span className="item-sub faint">Not a token you track — ADRIX read its symbol from the contract.</span>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {approvals.map((approval, index) => (
+        <div className="sim-row approval" key={`approval-${index}`}>
+          <span className="sim-sign" aria-hidden="true">
+            ⚑
+          </span>
+          <div className="item-main">
+            <span className="sim-amount">
+              {approval.revoking
+                ? 'Revokes approval'
+                : approval.operator
+                  ? 'Grants control of every NFT in a collection'
+                  : approval.unlimited
+                    ? `Grants unlimited ${approval.symbol ?? 'token'} spending`
+                    : `Grants ${approval.displayAmount ?? approval.amount} ${approval.symbol ?? ''} spending`}
+            </span>
+            <span className="item-sub">to {shorten(approval.spender, 8, 6)}</span>
+          </div>
+        </div>
+      ))}
+
+      <p className="small faint">
+        {simulation.method === 'eth_simulateV1'
+          ? 'Simulated against the current chain state with eth_simulateV1. State can change before this is mined.'
+          : simulation.method === 'debug_traceCall'
+            ? 'Traced against the current chain state. Token movements are not visible with this method.'
+            : 'Only a revert check was possible on this endpoint.'}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Site and address screening verdict.
+ *
+ * Levels rather than a boolean: "we have never seen this site" and "this site
+ * is impersonating uniswap.org" deserve very different amounts of the user's
+ * attention, and treating them the same trains people to click through both.
+ */
+export function SecurityBanner({ security }) {
+  if (!security) return null;
+
+  const blocks = [
+    { source: security.domain, kind: 'site' },
+    { source: security.spender, kind: 'spender' },
+    { source: security.target, kind: 'recipient' },
+  ].filter((entry) => entry.source && ['caution', 'warn', 'danger'].includes(entry.source.level));
+
+  if (!blocks.length) {
+    // Recognising a site is worth stating — it is the only positive signal the
+    // user ever gets, and its absence is what makes every prompt feel the same.
+    if (security.domain?.level === 'known') {
+      return <div className="notice info">ADRIX recognises this site as {security.domain.hostname}.</div>;
+    }
+    return null;
+  }
+
+  return (
+    <>
+      {blocks.map(({ source, kind }) => (
+        <div
+          className={source.level === 'danger' ? 'notice danger' : 'notice'}
+          key={kind}
+          role={source.level === 'danger' ? 'alert' : undefined}
+        >
+          <b>
+            {source.level === 'danger' ? '⚠ ' : ''}
+            {kind === 'site'
+              ? source.impersonating
+                ? `This site is impersonating ${source.impersonating.target}`
+                : 'This site is flagged'
+              : kind === 'spender'
+                ? 'The address being granted access is flagged'
+                : 'The recipient is flagged'}
+          </b>
+          <ul className="plain-list small" style={{ marginTop: 4 }}>
+            {source.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
+  );
+}
+
 export function BackBar({ title, onBack, right = null }) {
   return (
     <header className="topbar">

@@ -78,9 +78,9 @@ export default function Home({ state, go, refresh, params }) {
 
   // The all-accounts view fans out across every account × every chain, so it is
   // only fetched when that tab is actually open.
-  const loadPortfolios = async () => {
+  const loadPortfolios = async ({ force = false } = {}) => {
     try {
-      setPortfolios(await call('GET_PORTFOLIOS'));
+      setPortfolios(await call('GET_PORTFOLIOS', { force }));
     } catch (err) {
       setError(err.message);
     }
@@ -230,6 +230,18 @@ export default function Home({ state, go, refresh, params }) {
           </div>
         )}
 
+        {/* A rate-limited price cache keeps serving old numbers that look
+            current. Fiat values are the one place that silence is misleading. */}
+        {(portfolio?.priceState?.rateLimited || portfolio?.priceState?.stale) && (
+          <div className="pad-x" style={{ paddingBottom: 12 }}>
+            <div className="notice">
+              {portfolio.priceState.rateLimited
+                ? `${portfolio.priceState.source} is rate limiting ADRIX, so fiat values are from ${portfolio.priceState.cachedAt ? timeAgo(portfolio.priceState.cachedAt) : 'earlier'} and are not updating.`
+                : `Fiat values are from ${timeAgo(portfolio.priceState.cachedAt)}. Token balances are read live from the chain and are current.`}
+            </div>
+          </div>
+        )}
+
         <div className="action-row">
           {[
             ['send', '↗', 'Send'],
@@ -323,7 +335,7 @@ export default function Home({ state, go, refresh, params }) {
               currency={currency}
               selected={state.selected}
               go={go}
-              onRetry={loadPortfolios}
+              onRetry={() => loadPortfolios({ force: true })}
             />
           ) : (
             <Activity
@@ -423,6 +435,7 @@ function Tokens({ portfolio, loading, currency, go, onChange }) {
               <div className="asset-amount">{trimAmount(portfolio?.native?.balance)}</div>
               <div className="asset-fiat">
                 {formatFiat(portfolio?.native?.fiat, currency, { placeholder: 'No rate' })}
+                <PriceChange value={portfolio?.native?.change24h} />
               </div>
             </div>
           </div>
@@ -453,7 +466,10 @@ function Tokens({ portfolio, loading, currency, go, onChange }) {
                 </div>
                 <div className="asset-values">
                   <div className="asset-amount">{token.error ? '--' : trimAmount(token.balance)}</div>
-                  <div className="asset-fiat">{formatFiat(token.fiat, currency, { placeholder: 'No rate' })}</div>
+                  <div className="asset-fiat">
+                    {formatFiat(token.fiat, currency, { placeholder: 'No rate' })}
+                    <PriceChange value={token.change24h} />
+                  </div>
                 </div>
               </div>
               {managing === token.address && (
@@ -1104,18 +1120,91 @@ function AccountPortfolio({ portfolios, currency, selected, go, onRetry }) {
     return <EmptyState icon="◇" title="No visible accounts" body="Unhide an account to see it here." />;
   }
 
+  const allocation = portfolios.allocation;
+
   return (
     <div className="stack">
       <div className="card accent center">
         <div className="eyebrow">Total across all accounts and chains</div>
         <div className="balance">{formatFiat(portfolios.totalFiat, currency, { placeholder: 'No price data' })}</div>
+        <span className="small faint">
+          {accounts.length} account{accounts.length === 1 ? '' : 's'} · {portfolios.chainsQueried} networks
+          {portfolios.cached ? ' · cached' : ''}
+          {portfolios.fetchedAt ? ` · ${timeAgo(portfolios.fetchedAt)}` : ''}
+        </span>
       </div>
+
+      {/* An unreachable chain leaves a hole in the total. Reporting it is the
+          difference between an incomplete number and a wrong one. */}
+      {portfolios.failures?.length > 0 && (
+        <div className="notice">
+          <b>{portfolios.failures.length} chain reads failed.</b>
+          <p className="small">
+            The total below is missing whatever is held on{' '}
+            {[...new Set(portfolios.failures.map((f) => f.network))].join(', ')}. This is usually a rate-limited public
+            endpoint — add a fallback in Networks.
+          </p>
+        </div>
+      )}
+
+      {allocation?.chains?.length > 0 && (
+        <div className="card">
+          <span className="eyebrow">Where it is</span>
+          {allocation.chains
+            .filter((chain) => chain.fiat > 0 || chain.tokenCount > 0)
+            .map((chain) => (
+              <div className="alloc-row" key={chain.chainId}>
+                <div className="alloc-head">
+                  <span className="alloc-name">{chain.name}</span>
+                  <span className="mono small">
+                    {formatFiat(chain.fiat, currency, { placeholder: '--' })}
+                    {chain.share != null ? ` · ${chain.share}%` : ''}
+                  </span>
+                </div>
+                <span className="alloc-bar" aria-hidden="true">
+                  <span style={{ width: `${chain.share ?? 0}%` }} />
+                </span>
+                <span className="item-sub">
+                  {trimAmount(chain.nativeBalance)} {chain.symbol}
+                  {chain.tokenCount > 0 && ` · ${chain.tokenCount} token position${chain.tokenCount === 1 ? '' : 's'}`}
+                  {chain.nftCount > 0 && ` · ${chain.nftCount} NFT${chain.nftCount === 1 ? '' : 's'}`}
+                </span>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {allocation?.assets?.length > 0 && (
+        <div className="card">
+          <span className="eyebrow">By asset</span>
+          <p className="small faint">
+            The same symbol on several chains is one position here — that is how a holding is actually held.
+          </p>
+          {allocation.assets.map((asset) => (
+            <div className="kv" key={asset.key}>
+              <span className="kv-key">
+                {asset.symbol}
+                {asset.chainCount > 1 && <span className="badge" style={{ marginLeft: 6 }}>{asset.chainCount} chains</span>}
+              </span>
+              <span className="kv-value mono">
+                {formatFiat(asset.fiat, currency, { placeholder: '--' })}
+                {asset.share != null ? ` · ${asset.share}%` : ''}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="list">
         {accounts.map((account) => (
           <PortfolioRow key={account.address} account={account} currency={currency} selected={selected} />
         ))}
       </div>
+
+      <p className="small faint">
+        NFT counts here come from what ADRIX has stored rather than a fresh read — checking ownership across every
+        account and chain would mean hundreds of requests. Open a single network's NFT tab for live data.
+      </p>
 
       <div className="row2">
         <button className="ghost" onClick={onRetry}>
@@ -1573,6 +1662,17 @@ function Activity({ portfolio, loading, onChange, onOpen, nonceInfo }) {
         </div>
       )}
     </div>
+  );
+}
+
+/** A 24h move, rendered only when there is one. Zero is not the same as absent. */
+function PriceChange({ value }) {
+  if (value == null || !Number.isFinite(Number(value))) return null;
+  const change = Number(value);
+  return (
+    <span className={`price-change ${change >= 0 ? 'up' : 'down'}`}>
+      {change >= 0 ? '▲' : '▼'} {Math.abs(change).toFixed(2)}%
+    </span>
   );
 }
 

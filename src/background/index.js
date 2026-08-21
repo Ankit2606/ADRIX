@@ -15,6 +15,14 @@ import * as tokenLists from './tokenLists.js';
 import * as signatures from './signatures.js';
 import * as backup from './backup.js';
 import * as poisoning from './poisoning.js';
+import * as security from './security.js';
+import * as simulation from './simulation.js';
+import * as swap from './swap.js';
+import * as onramp from './onramp.js';
+import * as batch from './batch.js';
+import * as safe from './safe.js';
+import * as aa from './erc4337.js';
+import * as watcher from './watcher.js';
 import { globalSearch } from './search.js';
 import { handleRpc } from './rpc.js';
 import { broadcastEvent, notifyUi } from './events.js';
@@ -41,6 +49,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
   if (alarm.name === 'poll-receipts') {
     await txs.pollReceipts();
+  }
+  if (alarm.name === 'watch-incoming') {
+    // Incoming detection runs whether or not the wallet is unlocked: arriving
+    // funds are public information and the watcher touches no key material.
+    await watcher.pollIncoming().catch(() => {});
   }
 });
 
@@ -141,8 +154,8 @@ async function getState() {
 
 /** Attaches live fiat values to one chain's native balance and token list. */
 async function priceChain(chainId, nativeBalanceStr, tokenList, currency) {
-  const [native, tokenMap] = await Promise.all([
-    prices.nativePrice(chainId, currency),
+  const [nativeInfo, tokenMap] = await Promise.all([
+    prices.nativeQuote(chainId, currency),
     prices.tokenPrices(
       chainId,
       tokenList.map((token) => token.address),
@@ -150,13 +163,22 @@ async function priceChain(chainId, nativeBalanceStr, tokenList, currency) {
     ),
   ]);
 
+  const native = nativeInfo?.price ?? null;
+  const changes = prices.tokenChanges(chainId, currency);
+
   const pricedTokens = tokenList.map((token) => {
     const price = tokenMap[token.address.toLowerCase()] ?? null;
-    return { ...token, price, fiat: prices.fiatValue(token.balance, price) };
+    return {
+      ...token,
+      price,
+      change24h: changes[token.address.toLowerCase()] ?? null,
+      fiat: prices.fiatValue(token.balance, price),
+    };
   });
 
   return {
     nativePrice: native,
+    nativeChange24h: nativeInfo?.change24h ?? null,
     nativeFiat: prices.fiatValue(nativeBalanceStr, native),
     tokens: pricedTokens,
     // Only chains with real price data contribute to a total. A missing price
@@ -222,8 +244,12 @@ async function getPortfolio() {
       balance: nativeBalanceStr,
       raw: balance.toString(),
       price: priced.nativePrice,
+      change24h: priced.nativeChange24h,
       fiat: priced.nativeFiat,
     },
+    // Whether the numbers above can be trusted right now. A rate-limited cache
+    // serves hours-old prices that look exactly like fresh ones.
+    priceState: prices.priceState(),
     tokens: spam.annotateTokens(priced.tokens, { chainId }),
     totalFiat: priced.total,
     nfts: nftsWithFloors,
@@ -238,11 +264,25 @@ async function getPortfolio() {
   };
 }
 
-async function getPortfolios() {
+// The aggregate view is accounts × chains, so its cost multiplies fast. Cached
+// briefly: the tab is usually opened, read, and closed again within seconds,
+// and re-running the whole fan-out on every state broadcast is what made it
+// feel broken.
+let portfoliosCache = null;
+const PORTFOLIOS_TTL_MS = 45_000;
+
+async function getPortfolios({ force = false } = {}) {
   const currentChainId = await networks.getChainId();
   const allNets = await networks.visibleNetworks();
   const accounts = await ens.enrichAccounts(await keyring.listVisibleAccounts());
   const currency = await prices.getCurrency();
+
+  const cacheKey = `${currentChainId}:${currency}:${accounts.map((a) => a.address).join(',')}:${Object.keys(allNets).join(',')}`;
+  if (!force && portfoliosCache && portfoliosCache.key === cacheKey && Date.now() - portfoliosCache.at < PORTFOLIOS_TTL_MS) {
+    return { ...portfoliosCache.value, cached: true, fetchedAt: portfoliosCache.at };
+  }
+
+  const failures = [];
 
   const rows = await Promise.all(
     accounts.map(async (account) => {
@@ -254,7 +294,11 @@ async function getPortfolios() {
               const [balance, tokenList, nftList] = await Promise.all([
                 provider.getBalance(account.address).catch(() => 0n),
                 tokens.tokenBalances(account.address, net.chainId).catch(() => []),
-                tokens.nftBalances(account.address, net.chainId).catch(() => []),
+                // Stored records only. nftBalances re-reads ownership and
+                // refetches metadata over HTTP for every token, which across
+                // accounts × chains turned this screen into hundreds of
+                // requests. The single-chain view keeps them accurate.
+                tokens.listStoredNfts(net.chainId).catch(() => []),
               ]);
 
               const balanceStr = formatEther(balance);
@@ -272,9 +316,18 @@ async function getPortfolios() {
                   fiat: priced.nativeFiat,
                 },
                 tokens: priced.tokens.filter((token) => token.raw && BigInt(token.raw) > 0n),
-                nfts: nftList.filter((nft) => nft.balance != null && BigInt(nft.balance) > 0n),
+                nfts: nftList,
               };
-            } catch {
+            } catch (err) {
+              // Recorded rather than swallowed. A chain that silently vanishes
+              // makes the total quietly wrong, and the user has no way to tell
+              // an empty chain from an unreachable one.
+              failures.push({
+                chainId: net.chainId,
+                network: net.name,
+                account: account.address,
+                error: err.shortMessage ?? err.message,
+              });
               return null;
             }
           })
@@ -303,8 +356,76 @@ async function getPortfolios() {
 
   const currentNetwork = await networks.getNetwork(currentChainId);
   const totalNativeRaw = rows.reduce((sum, row) => sum + BigInt(row.native.raw ?? '0'), 0n);
+  const totalFiat = rows.reduce((sum, row) => sum + row.totalFiat, 0);
 
-  return {
+  // Where the money actually is, by chain and by asset. The single total
+  // answers "how much"; these answer "where", which is the question that
+  // decides whether to switch networks or bridge.
+  const byChain = new Map();
+  const byAsset = new Map();
+
+  for (const row of rows) {
+    for (const chain of row.chainBalances) {
+      const entry = byChain.get(chain.chainId) ?? {
+        chainId: chain.chainId,
+        name: chain.network.name,
+        symbol: chain.network.symbol,
+        fiat: 0,
+        nativeRaw: 0n,
+        tokenCount: 0,
+        nftCount: 0,
+        accounts: 0,
+      };
+      entry.fiat += chain.fiat;
+      entry.nativeRaw += BigInt(chain.native.raw ?? '0');
+      entry.tokenCount += chain.tokens.length;
+      entry.nftCount += chain.nfts.length;
+      if (chain.fiat > 0 || BigInt(chain.native.raw ?? '0') > 0n) entry.accounts += 1;
+      byChain.set(chain.chainId, entry);
+
+      const nativeKey = `native:${chain.chainId}`;
+      const nativeEntry = byAsset.get(nativeKey) ?? { key: nativeKey, symbol: chain.network.symbol, kind: 'native', fiat: 0 };
+      nativeEntry.fiat += chain.native.fiat ?? 0;
+      byAsset.set(nativeKey, nativeEntry);
+
+      for (const token of chain.tokens) {
+        // Grouped by symbol rather than by contract: USDC on four chains is one
+        // position from the holder's point of view, not four.
+        const key = `token:${(token.symbol ?? token.address).toUpperCase()}`;
+        const tokenEntry = byAsset.get(key) ?? { key, symbol: token.symbol ?? '?', kind: 'token', fiat: 0, chains: new Set() };
+        tokenEntry.fiat += token.fiat ?? 0;
+        tokenEntry.chains.add(chain.chainId);
+        byAsset.set(key, tokenEntry);
+      }
+    }
+  }
+
+  const share = (value) => (totalFiat > 0 ? Math.round((value / totalFiat) * 1000) / 10 : null);
+
+  const allocation = {
+    chains: [...byChain.values()]
+      .map((entry) => ({
+        ...entry,
+        nativeRaw: entry.nativeRaw.toString(),
+        nativeBalance: formatEther(entry.nativeRaw),
+        share: share(entry.fiat),
+      }))
+      .sort((a, b) => b.fiat - a.fiat),
+    assets: [...byAsset.values()]
+      .map((entry) => ({
+        key: entry.key,
+        symbol: entry.symbol,
+        kind: entry.kind,
+        fiat: entry.fiat,
+        chainCount: entry.chains ? entry.chains.size : 1,
+        share: share(entry.fiat),
+      }))
+      .filter((entry) => entry.fiat > 0)
+      .sort((a, b) => b.fiat - a.fiat)
+      .slice(0, 12),
+  };
+
+  const value = {
     chainId: currentChainId,
     network: currentNetwork,
     currency,
@@ -313,9 +434,19 @@ async function getPortfolios() {
       balance: formatEther(totalNativeRaw),
       raw: totalNativeRaw.toString(),
     },
-    totalFiat: rows.reduce((sum, row) => sum + row.totalFiat, 0),
+    totalFiat,
     accounts: rows,
+    allocation,
+    // Chains that could not be read at all. Their balances are missing from the
+    // total, and saying so is the difference between a wrong number and an
+    // incomplete one.
+    failures,
+    chainsQueried: Object.keys(allNets).length,
+    fetchedAt: Date.now(),
   };
+
+  portfoliosCache = { key: cacheKey, at: Date.now(), value };
+  return { ...value, cached: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +455,155 @@ async function getPortfolios() {
 const handlers = {
   GET_STATE: () => getState(),
   GET_PORTFOLIO: () => getPortfolio(),
-  GET_PORTFOLIOS: () => getPortfolios(),
+  GET_PORTFOLIOS: ({ force = false } = {}) => getPortfolios({ force }),
+
+  // --- simulation ----------------------------------------------------------
+  SIMULATE: async ({ request }) =>
+    simulation.simulateTransaction({ ...request, from: request.from ?? (await keyring.getSelected()) }),
+
+  // --- swap and bridge -----------------------------------------------------
+  SWAP_CHAINS: async () => ({ chains: await swap.supportedChains() }),
+  SWAP_TOKENS: ({ chainId }) => swap.swapTokens(chainId).then((tokenList) => ({ tokens: tokenList })),
+  SWAP_QUOTE: async (payload) =>
+    swap.getQuote({ ...payload, fromAddress: payload.fromAddress ?? (await keyring.getSelected()) }),
+  SWAP_ALLOWANCE: async ({ chainId, token, spender, amountRaw }) =>
+    swap.checkSwapAllowance({ chainId, token, spender, amountRaw, owner: await keyring.getSelected() }),
+  SWAP_APPROVE: async ({ chainId, token, spender, amountRaw, fees, gas }) => {
+    const hash = await swap.approveForSwap({
+      chainId,
+      token,
+      spender,
+      amountRaw,
+      fees,
+      gas,
+      from: await keyring.getSelected(),
+    });
+    return { hash };
+  },
+  SWAP_VERIFY: async ({ quote, allowanceReady }) =>
+    swap.verifyQuote(quote, { from: await keyring.getSelected(), allowanceReady }),
+  SWAP_EXECUTE: async ({ quote, fees, gas }) => {
+    const hash = await swap.executeQuote({ quote, fees, gas, from: await keyring.getSelected() });
+    return { hash };
+  },
+  BRIDGE_STATUS: ({ txHash, fromChainId, toChainId, tool }) =>
+    swap.bridgeStatus({ txHash, fromChainId, toChainId, tool }),
+
+  // --- fiat on-ramp --------------------------------------------------------
+  ONRAMP_PROVIDERS: async ({ chainId }) => ({
+    providers: await onramp.listProviders(chainId ?? (await networks.getChainId())),
+    handoffs: await onramp.listHandoffs(),
+  }),
+  ONRAMP_SET_KEY: ({ id, apiKey }) => onramp.setProviderKey(id, apiKey),
+  ONRAMP_URL: async ({ providerId, symbol, fiatAmount, fiatCurrency }) => {
+    const address = await keyring.getSelected();
+    const accounts = await keyring.listAccounts();
+    return onramp.buildOnrampUrl({
+      providerId,
+      address,
+      chainId: await networks.getChainId(),
+      symbol,
+      fiatAmount,
+      fiatCurrency,
+      // Cross-checked against the wallet's own accounts before the address goes
+      // into a URL — a pre-filled wrong address looks authoritative.
+      ownedAddresses: accounts.map((account) => account.address),
+    });
+  },
+  ONRAMP_RECORD: async (payload) =>
+    onramp.recordHandoff({ ...payload, address: await keyring.getSelected(), chainId: await networks.getChainId() }),
+  ONRAMP_CLEAR: () => onramp.clearHandoffs(),
+
+  // --- batch transfers -----------------------------------------------------
+  BATCH_PREPARE: async ({ transfers, tokenAddress }) =>
+    batch.prepareBatch({ from: await keyring.getSelected(), transfers, tokenAddress }),
+  BATCH_SEND: async ({ transfers, tokenAddress, fees, gas }) =>
+    batch.sendBatch({ from: await keyring.getSelected(), transfers, tokenAddress, fees, gas }),
+
+  // --- Safe multisig -------------------------------------------------------
+  SAFE_INSPECT: ({ address, chainId }) => safe.inspectSafe(address, chainId),
+  SAFE_PENDING: ({ address, chainId }) => safe.listPendingSafeTransactions(address, chainId),
+  SAFE_BUILD: ({ safeAddress, to, value, data, operation, nonce }) =>
+    safe.buildSafeTransaction({ safeAddress, to, value, data, operation, nonce }),
+  /** Signs and publishes a new proposal in one step — an unshared signature helps nobody. */
+  SAFE_PROPOSE: async ({ safeAddress, tx, safeTxHash, ownerAddress }) => {
+    const { owner, signature } = await safe.signSafeTransaction({ safeAddress, tx, ownerAddress });
+    const result = await safe.proposeSafeTransaction({ safeAddress, tx, safeTxHash, ownerAddress: owner, signature });
+    notifyUi();
+    return result;
+  },
+  SAFE_CONFIRM: async ({ safeAddress, tx, safeTxHash, ownerAddress }) => {
+    const { signature } = await safe.signSafeTransaction({ safeAddress, tx, ownerAddress });
+    const result = await safe.confirmSafeTransaction({ safeTxHash, signature });
+    notifyUi();
+    return result;
+  },
+  SAFE_CHECK_EXECUTABLE: async ({ safeAddress, tx, confirmations, executor }) =>
+    safe.checkExecutable({
+      safeAddress,
+      tx,
+      confirmations,
+      executor: executor ?? (await keyring.getSelected()),
+    }),
+  SAFE_EXECUTE: async ({ safeAddress, tx, confirmations, fees, gas }) => {
+    const from = await keyring.getSelected();
+    const hash = await txs.sendTransaction({
+      from,
+      to: safeAddress,
+      value: '0x0',
+      data: safe.encodeExecution({ tx, confirmations }),
+      fees,
+      gas,
+      meta: { kind: 'safeExecute', safeAddress, safeNonce: tx.nonce },
+    });
+    return { hash };
+  },
+
+  // --- ERC-4337 smart accounts ---------------------------------------------
+  AA_CONFIG: ({ chainId }) => aa.getBundlerConfig(chainId),
+  AA_SET_CONFIG: ({ chainId, bundlerUrl, paymasterUrl, paymasterContext }) =>
+    aa.setBundlerConfig(chainId, { bundlerUrl, paymasterUrl, paymasterContext }),
+  AA_TEST_BUNDLER: ({ url, chainId }) => aa.testBundler(url, chainId),
+  AA_INSPECT: ({ address, chainId }) => aa.inspectSmartAccount(address, chainId),
+  AA_PREPARE: ({ sender, calls, chainId, sponsor }) =>
+    aa.prepareUserOperation({ sender, calls, chainId, sponsor }),
+  AA_SEND: ({ prepared }) => aa.sendUserOperation({ prepared }),
+  AA_STATUS: ({ userOpHash, chainId }) => aa.userOperationStatus({ userOpHash, chainId }),
+
+  // --- notifications -------------------------------------------------------
+  NOTIFICATION_PREFS: () => watcher.watchStatus(),
+  SET_NOTIFICATION_PREFS: ({ prefs }) => watcher.setNotificationPrefs(prefs),
+  RESET_WATCH: () => watcher.resetWatch(),
+  POLL_INCOMING: () => watcher.pollIncoming(),
+
+  // --- prices --------------------------------------------------------------
+  PRICE_STATE: () => prices.priceState(),
+
+  // --- security lists ------------------------------------------------------
+  GET_SECURITY_LISTS: () => security.getSecurityLists(),
+  SCREEN_DOMAIN: ({ origin }) => security.screenDomain(origin),
+  SCREEN_ADDRESS: async ({ address, chainId }) =>
+    security.screenAddress(address, { provider: await networks.getProvider(chainId) }),
+  ADD_SECURITY_ENTRY: async ({ kind, value }) => {
+    const result = await security.addToList(kind, value);
+    notifyUi();
+    return result;
+  },
+  REMOVE_SECURITY_ENTRY: async ({ kind, value }) => {
+    const result = await security.removeFromList(kind, value);
+    notifyUi();
+    return result;
+  },
+  IMPORT_SECURITY_FEED: async ({ url, name }) => {
+    const result = await security.importSecurityFeed(url, name);
+    notifyUi();
+    return result;
+  },
+  REMOVE_SECURITY_FEED: async ({ url }) => {
+    const result = await security.removeSecurityFeed(url);
+    notifyUi();
+    return result;
+  },
 
   // --- vault ---------------------------------------------------------------
   CREATE_WALLET: ({ password }) => keyring.createVault(password),
@@ -841,3 +1120,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Restart receipt polling if the worker was torn down with pending txs.
 txs.scheduleReceiptPolling();
+
+// And the incoming watcher, which otherwise dies with the service worker and
+// never restarts — the failure mode being "notifications silently stopped".
+watcher
+  .getNotificationPrefs()
+  .then((prefs) => {
+    if (prefs.enabled && prefs.incoming) watcher.scheduleWatch();
+  })
+  .catch(() => {});

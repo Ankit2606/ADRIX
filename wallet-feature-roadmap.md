@@ -88,11 +88,8 @@ Updated: 17 Aug 2026
 ## Advanced
 - Transaction simulation before signing
 - Balance change preview before confirmation
-- Token allowance dashboard
 - Scam/phishing domain warning list
 - Malicious contract/address warnings
-- Hardware wallet support
-- WalletConnect support
 - Multi-chain portfolio aggregation
 - Token prices and fiat balances
 - Swap integration
@@ -101,17 +98,18 @@ Updated: 17 Aug 2026
 - Batch transactions
 - Permit signature detection
 - EIP-712 typed data human-readable parser
-- Session keys / spending limits
-- Social recovery or guardian recovery
 - Multi-sig account support
 - Smart account / account abstraction support
 - Gas sponsorship / paymaster support
 - Bundler support for ERC-4337
 - Push notifications for incoming/outgoing transactions
+
+
 - **EIP-7702 delegation support** — the big gap here. Post-Pectra, plain EOAs can delegate to smart-contract code, which is how most wallets are now delivering batching, sponsorship, and session keys without migrating users to a new 4337 address. Your list jumps straight to 4337/bundlers and skips the path most users will actually take.
 - **Passkey / WebAuthn signing** (secp256r1, EIP-7212) for smart accounts
 - **MPC / threshold-signature accounts** as an alternative to seed-phrase custody
 - **Air-gapped QR signing** (Keystone/UR format) alongside USB hardware wallets
+
 - **MEV protection / private transaction RPC** (Flashbots Protect–style default for swaps)
 - **Slippage settings + price impact warning** on swaps
 - **Cross-chain gas payment / pay fees in stablecoins**
@@ -223,3 +221,16 @@ Your original five were well chosen. Reordered with the additions folded in:
 ### One structural note
 
 Your **Advanced** section commits to ERC-4337 (bundlers, paymasters, smart accounts) without mentioning EIP-7702. Since Pectra, 7702 delegation gets you batching, sponsorship, and session keys on the user's *existing* address, with no migration and no bundler infrastructure. If you're deciding where account-abstraction effort goes, that decision is worth making explicitly before either path gets built.
+
+
+
+
+
+
+
+
+- Token allowance dashboard
+- Hardware wallet support
+- WalletConnect support
+- Session keys / spending limits
+- Social recovery or guardian recovery

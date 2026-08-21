@@ -1,13 +1,26 @@
-import { getAddress, isHexString, toUtf8String } from 'ethers';
-import { getChainId, getNetwork, setChain, addNetwork, allNetworks, rpcPassthrough, testRpc } from './networks.js';
+import { Contract, getAddress, isHexString, toUtf8String } from 'ethers';
+import {
+  getChainId,
+  getNetwork,
+  getProvider,
+  setChain,
+  addNetwork,
+  allNetworks,
+  rpcPassthrough,
+  testRpc,
+} from './networks.js';
 import { getWallet, hasVault, isUnlocked, listAccounts } from './keyring.js';
+import * as contacts from './contacts.js';
+import { ERC20_ABI } from './tokens.js';
+import { parseTypedData, extractPermitGrant } from './typedData.js';
+import { screenAddress } from './security.js';
 import * as permissions from './permissions.js';
 import { askUser } from './approvals.js';
 import { sendTransaction, estimateGas, describeTransaction, inspectApproval } from './transactions.js';
 import { addToken } from './tokens.js';
 import * as signatures from './signatures.js';
 import { broadcastEvent, notifyUi } from './events.js';
-import { isDomainFlagged, isAddressFlagged } from './security.js';
+import { simulateTransaction } from './simulation.js';
 
 const fail = (code, message) => {
   throw Object.assign(new Error(message), { code });
@@ -55,6 +68,63 @@ async function requireUnlockedAccount(origin, address) {
   // A locked wallet is not an error here: the approval window unlocks inline,
   // and getWallet() throws if the user backs out of that.
   return target;
+}
+
+/**
+ * Resolves the off-chain facts the typed-data parser needs: how to render the
+ * token's amounts, and which addresses in the payload the wallet recognises.
+ *
+ * Recognising an address is worth as much as decoding a field — "spender:
+ * 0x1231…4eae" and "spender: the Uniswap router you have used before" are the
+ * same hex and completely different decisions.
+ */
+async function typedDataContext({ typed, account, chainId }) {
+  const context = { knownAddresses: {} };
+
+  const label = (address, text, level = null) => {
+    if (!address) return;
+    try {
+      context.knownAddresses[getAddress(String(address)).toLowerCase()] = { label: text, level };
+    } catch {
+      /* not an address */
+    }
+  };
+
+  label(account, 'this account — you');
+
+  try {
+    for (const entry of await listAccounts()) label(entry.address, `your account "${entry.name}"`);
+  } catch {
+    /* accounts unavailable */
+  }
+  try {
+    for (const contact of await contacts.listContacts()) label(contact.address, `your contact "${contact.name}"`);
+  } catch {
+    /* contacts unavailable */
+  }
+
+  // Amount fields in a permit are denominated in the verifying contract's
+  // token, so its decimals are what makes them readable.
+  const tokenAddress = typed?.domain?.verifyingContract;
+  if (tokenAddress) {
+    try {
+      const provider = await getProvider(chainId);
+      const token = new Contract(getAddress(tokenAddress), ERC20_ABI, provider);
+      const [decimals, symbol] = await Promise.all([
+        token.decimals().catch(() => null),
+        token.symbol().catch(() => null),
+      ]);
+      if (decimals != null) {
+        context.decimals = Number(decimals);
+        context.symbol = symbol ?? null;
+        label(tokenAddress, `the ${symbol ?? 'token'} contract`);
+      }
+    } catch {
+      /* not a token, or unreachable */
+    }
+  }
+
+  return context;
 }
 
 function decodeMessage(value) {
@@ -211,13 +281,41 @@ export async function handleRpc(method, params = [], origin) {
       const account = await requireUnlockedAccount(origin, maybeAddress);
       const typed = typeof payload === 'string' ? JSON.parse(payload) : payload;
 
+      // Everything needing a network read is gathered here so the parser itself
+      // stays pure and cannot stall the prompt.
+      const parsed = parseTypedData({
+        domain: typed.domain ?? {},
+        types: typed.types ?? {},
+        primaryType: typed.primaryType,
+        message: typed.message ?? {},
+        origin,
+        walletChainId: chainId,
+        context: await typedDataContext({ typed, account, chainId }),
+      });
+
+      const permit = extractPermitGrant({
+        primaryType: typed.primaryType,
+        domain: typed.domain ?? {},
+        message: typed.message ?? {},
+      });
+
+      // A permit hands spending rights to whoever the spender is, so that
+      // address gets the same screening a transaction recipient would.
+      const spenderScreen = permit?.spender
+        ? await screenAddress(permit.spender, { provider: await getProvider(chainId) }).catch(() => null)
+        : null;
+
       await askUser({
         kind: 'typedSign',
         origin,
         account,
+        chainId,
         primaryType: typed.primaryType,
         domain: typed.domain,
         message: typed.message,
+        parsed,
+        permit,
+        spenderScreen,
       });
       await permissions.touch(origin, 'typedSign', { account, primaryType: typed.primaryType });
 
@@ -252,12 +350,24 @@ export async function handleRpc(method, params = [], origin) {
       const account = await requireUnlockedAccount(origin, tx.from);
       const network = await getNetwork();
 
-      const gasInfo = await estimateGas({
-        from: account,
-        to: tx.to,
-        value: tx.value ?? '0x0',
-        data: tx.data ?? '0x',
-      });
+      // Gas estimate and simulation run together: the estimate says whether it
+      // reverts, the simulation says what it moves, and the user needs both on
+      // the same screen at the same time.
+      const [gasInfo, simulation] = await Promise.all([
+        estimateGas({
+          from: account,
+          to: tx.to,
+          value: tx.value ?? '0x0',
+          data: tx.data ?? '0x',
+        }),
+        simulateTransaction({
+          from: account,
+          to: tx.to,
+          value: tx.value ?? '0x0',
+          data: tx.data ?? '0x',
+          chainId,
+        }).catch(() => null),
+      ]);
 
       const summary = describeTransaction({ to: tx.to, value: tx.value ?? '0x0', data: tx.data ?? '0x' });
 
@@ -284,7 +394,9 @@ export async function handleRpc(method, params = [], origin) {
         explorer: network.explorer,
         gasInfo,
         summary,
+        simulation,
         approvalContext,
+        chainId,
         suggestedGas: tx.gas ?? tx.gasLimit ?? null,
       });
       await permissions.touch(origin, 'transaction', {

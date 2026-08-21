@@ -1,7 +1,8 @@
 // Queue of things waiting on the user: connect, sign, transaction, add chain,
 // switch chain, watch asset.
 
-import { isDomainFlagged, isAddressFlagged } from './security.js';
+import { screenDomain, screenAddress } from './security.js';
+import { getProvider } from './networks.js';
 
 const queue = new Map(); // id -> { request, resolve, reject, windowId }
 let nextId = 1;
@@ -22,11 +23,10 @@ export function listRequests() {
 export async function askUser(request) {
   const id = nextId++;
 
-  request.security = {
-    isDomainFlagged: request.origin ? isDomainFlagged(request.origin) : false,
-    isToAddressFlagged: request.to ? isAddressFlagged(request.to) : false,
-    isSpenderFlagged: request.summary?.spender ? isAddressFlagged(request.summary.spender) : false
-  };
+  // Screening runs before the window opens, so the prompt renders with its
+  // verdict already in hand rather than flashing a clean screen and then
+  // sprouting a warning after the user has started reading.
+  request.security = await screenRequest(request);
 
   const promise = new Promise((resolve, reject) => {
     queue.set(id, { request, resolve, reject, windowId: null });
@@ -56,6 +56,45 @@ export async function askUser(request) {
   queue.get(id).windowId = created.id;
 
   return promise;
+}
+
+/**
+ * Screens the site and the addresses a request touches.
+ *
+ * Deliberately best-effort throughout: a screening failure must never stop a
+ * legitimate request reaching the user, so every branch degrades to "unknown"
+ * rather than throwing.
+ */
+async function screenRequest(request) {
+  const security = { domain: null, target: null, spender: null, level: 'unknown' };
+
+  try {
+    if (request.origin) security.domain = await screenDomain(request.origin);
+  } catch {
+    /* unknown */
+  }
+
+  try {
+    const provider = request.chainId ? await getProvider(request.chainId) : await getProvider();
+    // The spender of an approval matters more than the contract being called,
+    // so it is always screened when present; the plain recipient is screened
+    // only when there is no spender, to keep this to one archive probe.
+    const spender = request.summary?.spender ?? request.approvalContext?.spender ?? null;
+    if (spender) {
+      security.spender = await screenAddress(spender, { provider });
+    } else if (request.to) {
+      security.target = await screenAddress(request.to, { provider });
+    }
+  } catch {
+    /* unknown */
+  }
+
+  const order = { unknown: 0, allowed: 0, known: 0, caution: 1, warn: 2, danger: 3 };
+  security.level = [security.domain?.level, security.target?.level, security.spender?.level]
+    .filter(Boolean)
+    .reduce((worst, level) => (order[level] > order[worst] ? level : worst), 'unknown');
+
+  return security;
 }
 
 export function resolveRequest(id, value) {

@@ -2527,3 +2527,288 @@ button.nft-card {
 .addr-compare-label + .mono {
   margin-bottom: 4px;
 }
+
+/* --- simulation / balance changes ------------------------------------------ */
+.sim-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.sim-row:first-of-type {
+  border-top: 0;
+}
+
+.sim-sign {
+  flex: 0 0 auto;
+  width: 18px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.sim-row.out .sim-sign {
+  color: var(--danger);
+}
+
+.sim-row.in .sim-sign {
+  color: var(--good);
+}
+
+.sim-row.approval .sim-sign {
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.sim-amount {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 620;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.sim-row.out .sim-amount {
+  color: var(--danger);
+}
+
+.sim-row.in .sim-amount {
+  color: var(--good);
+}
+
+.sim-symbol {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+/* --- portfolio allocation --------------------------------------------------- */
+.alloc-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.alloc-row:first-of-type {
+  border-top: 0;
+}
+
+.alloc-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.alloc-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.alloc-bar {
+  display: block;
+  height: 4px;
+  border-radius: var(--pill);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.alloc-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--pill);
+  background: var(--accent);
+  /* A chain holding a fraction of a percent still deserves a visible sliver
+     rather than collapsing to nothing. */
+  min-width: 2px;
+}
+
+/* --- price change ----------------------------------------------------------- */
+.price-change {
+  display: inline-block;
+  margin-left: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-change.up {
+  color: var(--good);
+}
+
+.price-change.down {
+  color: var(--danger);
+}
+
+/* --- swap / bridge ---------------------------------------------------------- */
+.swap-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.swap-input input,
+.swap-output {
+  flex: 1;
+  min-width: 0;
+  font-size: 20px;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.swap-output {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-select {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  max-width: 46%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.token-select:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+
+.token-select-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.token-select-symbol {
+  font-size: 12.5px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.token-select-label {
+  font-size: 9px;
+  color: var(--faint);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.token-picker {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+/* Sits between the two legs and overlaps their gap, the way every swap UI
+   places it — it reads as a hinge rather than another row. */
+.swap-flip {
+  align-self: center;
+  width: 32px;
+  height: 32px;
+  margin: -20px 0;
+  z-index: 2;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface-solid);
+  color: var(--accent);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.swap-flip:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.swap-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 14px 0;
+}
+
+.swap-leg {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.swap-amount {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--danger);
+}
+
+.swap-amount.in {
+  color: var(--good);
+}
+
+.swap-symbol {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.swap-arrow {
+  font-size: 15px;
+  color: var(--faint);
+  margin: 2px 0;
+}
+
+/* --- typed data fields ------------------------------------------------------ */
+/* Nesting is shown with a rule rather than indentation alone: at 380px wide,
+   indent-only nesting is invisible by the second level. */
+.field-nested {
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+
+.field-note {
+  margin: -2px 0 6px;
+  color: var(--faint);
+  line-height: 1.4;
+}
+
+/* --- batch transfer --------------------------------------------------------- */
+.batch-input {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.batch-input:first-of-type {
+  border-top: 0;
+}
+
+.batch-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.batch-row:first-of-type {
+  border-top: 0;
+}

@@ -482,6 +482,17 @@ export async function listHiddenNfts(chainId) {
   return Object.values(all[chain] ?? {}).filter((nft) => nft.hidden);
 }
 
+/**
+ * Tracked NFTs straight from storage, with no chain reads and no metadata
+ * fetches. For the all-accounts view, where doing the real thing would mean an
+ * ownership check and an HTTP request per token per account per chain.
+ */
+export async function listStoredNfts(chainId) {
+  const chain = chainId ?? (await getChainId());
+  const all = await readNfts();
+  return Object.values(all[chain] ?? {}).filter((nft) => !nft.hidden);
+}
+
 export async function nftBalances(owner, chainId) {
   const chain = chainId ?? (await getChainId());
   const all = await readNfts();
