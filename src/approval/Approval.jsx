@@ -272,6 +272,88 @@ function Connect({ accounts, chosen, setChosen, networks = {}, chainId, chosenNe
 }
 
 function PersonalSign({ request }) {
+  const [showRaw, setShowRaw] = useState(false);
+
+  // A SIWE login gets its own presentation: the fields that matter are checkable
+  // and the raw text buries them.
+  if (request.siwe) {
+    const siwe = request.siwe;
+    const check = request.siweCheck;
+
+    return (
+      <>
+        <h1>Sign in to {siwe.domain ?? 'this site'}</h1>
+        <p className="small">
+          A sign-in signature proves you control this account. It costs nothing and moves nothing — but it is a
+          credential, and whoever holds it can present it as you.
+        </p>
+
+        {check?.problems.map((problem) => (
+          <div className="notice danger" role="alert" key={problem}>
+            {problem}
+          </div>
+        ))}
+
+        <div className="card">
+          {check?.checks.map((entry) => (
+            <div className="kv" key={entry.label}>
+              <span className="kv-key">
+                {entry.ok ? '✓' : '⚠'} {entry.label}
+              </span>
+              <span
+                className="kv-value mono small break"
+                style={{ color: entry.ok ? undefined : 'var(--danger)' }}
+              >
+                {entry.label === 'Account' ? shorten(entry.value, 10, 8) : entry.value}
+              </span>
+            </div>
+          ))}
+          {siwe.uri && (
+            <div className="kv">
+              <span className="kv-key">URI</span>
+              <span className="kv-value mono small break">{siwe.uri}</span>
+            </div>
+          )}
+          {siwe.nonce && (
+            <div className="kv">
+              <span className="kv-key">Nonce</span>
+              <span className="kv-value mono small">{siwe.nonce}</span>
+            </div>
+          )}
+        </div>
+
+        {siwe.statement && (
+          <div className="card">
+            <div className="eyebrow">What the site states</div>
+            <p className="small">{siwe.statement}</p>
+          </div>
+        )}
+
+        {siwe.resources?.length > 0 && (
+          <div className="card">
+            <div className="eyebrow">Resources claimed</div>
+            {siwe.resources.map((resource) => (
+              <div className="data-block" key={resource}>
+                {resource}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="card">
+          <div className="between">
+            <span className="eyebrow">Signing with</span>
+            <button className="link accent" onClick={() => setShowRaw(!showRaw)} aria-expanded={showRaw}>
+              {showRaw ? 'hide message' : 'show message'}
+            </button>
+          </div>
+          <span className="mono small">{shorten(request.account, 10, 8)}</span>
+          {showRaw && <div className="data-block">{request.message}</div>}
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <h1>Sign this message</h1>

@@ -4,13 +4,16 @@ import { call, trimAmount, timeAgo, formatFiat, useAsyncAction } from '../../lib
 import { BackBar, EmptyState } from '../components/common.jsx';
 import {
   NATIVE_TOKEN,
+  PriceImpactWarning,
   QuoteSummary,
   QuoteVerification,
   SlippageControl,
   SwapFeeControls,
-  TokenSelect,
+  TokenPicker,
+  TokenTrigger,
   fmtUnits,
   useQuote,
+  useTokenList,
 } from '../components/swap.jsx';
 
 /**
@@ -36,9 +39,11 @@ export default function Swap({ state, go }) {
   const [preset, setPreset] = useState('market');
   const [hash, setHash] = useState('');
   const [supported, setSupported] = useState(null);
+  const [picker, setPicker] = useState(null);
   const { busy, error, setError, run } = useAsyncAction();
 
   const currency = portfolio?.currency ?? state.currency ?? 'usd';
+  const { tokens, loading: tokensLoading, find: findToken } = useTokenList(chainId);
 
   useEffect(() => {
     call('GET_PORTFOLIO').then(setPortfolio).catch(() => {});
@@ -47,22 +52,39 @@ export default function Swap({ state, go }) {
       .catch(() => setSupported([]));
   }, [state.selected, state.chainId]);
 
-  // The balance and decimals of whatever is being sold, so "Max" and the
-  // over-balance check mean something.
+  /**
+   * Decimals come from the token's own metadata, not from the wallet.
+   *
+   * This is what broke quoting: the picker offers the aggregator's full list —
+   * well over a thousand tokens per chain — but the lookup only searched the
+   * handful the wallet tracks. Selecting anything else produced no decimals, so
+   * no amount, so no quote, and the screen sat on "0.0" with no explanation.
+   * The balance is a separate question and is allowed to be unknown.
+   */
   const sellAsset = useMemo(() => {
-    if (!portfolio) return null;
-    if (fromToken?.toLowerCase() === NATIVE_TOKEN.toLowerCase()) {
-      return {
-        symbol: portfolio.native?.symbol,
-        decimals: 18,
-        balance: portfolio.native?.balance,
-        raw: portfolio.native?.raw,
-        native: true,
-      };
-    }
-    const token = portfolio.tokens?.find((t) => t.address?.toLowerCase() === fromToken?.toLowerCase());
-    return token ? { ...token, native: false } : null;
-  }, [portfolio, fromToken]);
+    const meta = findToken(fromToken);
+    const isNative = fromToken?.toLowerCase() === NATIVE_TOKEN.toLowerCase();
+
+    const held = isNative
+      ? { balance: portfolio?.native?.balance, raw: portfolio?.native?.raw }
+      : (() => {
+          const tracked = portfolio?.tokens?.find((t) => t.address?.toLowerCase() === fromToken?.toLowerCase());
+          return tracked ? { balance: tracked.balance, raw: tracked.raw } : { balance: null, raw: null };
+        })();
+
+    if (!meta && !isNative) return null;
+
+    return {
+      symbol: meta?.symbol ?? portfolio?.native?.symbol ?? '',
+      decimals: meta?.decimals ?? 18,
+      priceUSD: meta?.priceUSD ? Number(meta.priceUSD) : null,
+      logoURI: meta?.logoURI ?? null,
+      native: isNative,
+      ...held,
+    };
+  }, [findToken, fromToken, portfolio]);
+
+  const buyAsset = useMemo(() => findToken(toToken), [findToken, toToken]);
 
   const amountRaw = useMemo(() => {
     if (!amount || !sellAsset) return null;
@@ -74,7 +96,10 @@ export default function Swap({ state, go }) {
     }
   }, [amount, sellAsset]);
 
+  // Only meaningful when the wallet actually knows the balance. An untracked
+  // token has none, and treating unknown as zero would block every such swap.
   const overBalance = Boolean(amountRaw && sellAsset?.raw && BigInt(amountRaw) > BigInt(sellAsset.raw));
+  const balanceKnown = sellAsset?.raw != null;
 
   const { quote, error: quoteError, loading: quoting, fetchedAt } = useQuote({
     enabled: Boolean(amountRaw && toToken && fromToken && !overBalance),
@@ -292,90 +317,160 @@ export default function Swap({ state, go }) {
           />
         ) : (
           <>
-            <div className="card">
-              <div className="between">
-                <span className="eyebrow">You pay</span>
-                {sellAsset && (
-                  <button
-                    className="link accent"
-                    onClick={() =>
-                      setAmount(
-                        // Leaving the full native balance would leave nothing
-                        // for gas, so a slice is held back.
-                        sellAsset.native
-                          ? String(Math.max(0, Number(sellAsset.balance) * 0.98))
-                          : String(sellAsset.balance ?? '')
-                      )
-                    }
-                  >
-                    max {trimAmount(sellAsset.balance)}
-                  </button>
-                )}
-              </div>
-              <div className="swap-input">
-                <input
-                  className="mono"
-                  inputMode="decimal"
-                  placeholder="0.0"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value.replace(/[^\d.]/g, ''))}
-                  aria-invalid={overBalance}
-                  aria-label="Amount to swap"
+            {/* The picker replaces the form rather than opening inside it. A
+                full-width list cannot live in the row sized for a pill, which
+                is what pushed the whole screen sideways. */}
+            {picker ? (
+              <TokenPicker
+                chainId={chainId}
+                chainName={state.network?.name ?? 'this network'}
+                tokens={tokens}
+                loading={tokensLoading}
+                title={picker === 'from' ? 'Pay with' : 'Receive'}
+                exclude={picker === 'from' ? toToken : fromToken}
+                balances={portfolio?.tokens}
+                onClose={() => setPicker(null)}
+                onPick={(token) => {
+                  if (picker === 'from') setFromToken(token.address);
+                  else setToToken(token.address);
+                  setPicker(null);
+                }}
+              />
+            ) : (
+              <>
+                <div className="card">
+                  <div className="between">
+                    <span className="eyebrow">You pay</span>
+                    {balanceKnown && (
+                      <button
+                        className="link accent"
+                        onClick={() =>
+                          setAmount(
+                            // Leaving the full native balance would leave
+                            // nothing for gas, so a slice is held back.
+                            sellAsset.native
+                              ? String(Math.max(0, Number(sellAsset.balance) * 0.98))
+                              : String(sellAsset.balance ?? '')
+                          )
+                        }
+                      >
+                        max {trimAmount(sellAsset.balance)}
+                      </button>
+                    )}
+                  </div>
+                  <div className="swap-input">
+                    <input
+                      className="mono"
+                      inputMode="decimal"
+                      placeholder="0.0"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value.replace(/[^\d.]/g, ''))}
+                      aria-invalid={overBalance}
+                      aria-label="Amount to swap"
+                    />
+                    <TokenTrigger token={sellAsset} label="from" loading={tokensLoading} onOpen={() => setPicker('from')} />
+                  </div>
+                  <div className="between small faint">
+                    <span>
+                      {sellAsset?.priceUSD && amount
+                        ? `≈ ${formatFiat(Number(amount) * sellAsset.priceUSD, currency)}`
+                        : ''}
+                    </span>
+                    {!balanceKnown && sellAsset && (
+                      <span>Balance unknown — {sellAsset.symbol} is not tracked in this wallet</span>
+                    )}
+                  </div>
+                  {overBalance && <div className="error">That is more than the {sellAsset?.symbol} available.</div>}
+                </div>
+
+                <button
+                  className="swap-flip"
+                  onClick={() => {
+                    setFromToken(toToken || NATIVE_TOKEN);
+                    setToToken(fromToken);
+                    setAmount('');
+                  }}
+                  aria-label="Swap direction"
+                  disabled={!toToken}
+                >
+                  ⇅
+                </button>
+
+                <div className="card">
+                  <span className="eyebrow">You receive</span>
+                  <div className="swap-input">
+                    <span className="mono swap-output">
+                      {quote
+                        ? trimAmount(fmtUnits(quote.toAmountRaw, quote.toToken?.decimals), 6)
+                        : quoting
+                          ? '…'
+                          : '0.0'}
+                    </span>
+                    <TokenTrigger token={buyAsset} label="to" loading={tokensLoading} onOpen={() => setPicker('to')} />
+                  </div>
+                  <div className="between small faint">
+                    {/* Priced from the token list even before a route exists,
+                        so the output side is never a bare zero with no price. */}
+                    <span>
+                      {quote?.toAmountUsd != null
+                        ? `≈ ${formatFiat(quote.toAmountUsd, currency)}`
+                        : buyAsset?.priceUSD
+                          ? `1 ${buyAsset.symbol} ≈ ${formatFiat(Number(buyAsset.priceUSD), currency)}`
+                          : ''}
+                    </span>
+                    {quoting && <span>finding a route…</span>}
+                  </div>
+                </div>
+
+                <SlippageControl
+                  value={slippage}
+                  onChange={setSlippage}
+                  quote={quote}
+                  symbol={buyAsset?.symbol}
                 />
-                <TokenSelect chainId={chainId} value={fromToken} onChange={setFromToken} label="from" exclude={toToken} />
-              </div>
-              {overBalance && <div className="error">That is more than the {sellAsset?.symbol} available.</div>}
-            </div>
 
-            <button
-              className="swap-flip"
-              onClick={() => {
-                setFromToken(toToken || NATIVE_TOKEN);
-                setToToken(fromToken);
-                setAmount('');
-              }}
-              aria-label="Swap direction"
-              disabled={!toToken}
-            >
-              ⇅
-            </button>
+                <PriceImpactWarning quote={quote} />
 
-            <div className="card">
-              <span className="eyebrow">You receive</span>
-              <div className="swap-input">
-                <span className="mono swap-output">
-                  {quote ? trimAmount(fmtUnits(quote.toAmountRaw, quote.toToken?.decimals), 6) : quoting ? '…' : '0.0'}
-                </span>
-                <TokenSelect chainId={chainId} value={toToken} onChange={setToToken} label="to" exclude={fromToken} />
-              </div>
-              {quote?.toAmountUsd != null && (
-                <span className="small faint">≈ {formatFiat(quote.toAmountUsd, currency)}</span>
-              )}
-            </div>
+                {quote && <QuoteSummary quote={quote} currency={currency} stale={quoting} />}
+                {fetchedAt && (
+                  <p className="small faint center">
+                    Quote from {timeAgo(fetchedAt)}, refreshed automatically. Rates move between quoting and signing.
+                  </p>
+                )}
 
-            <SlippageControl value={slippage} onChange={setSlippage} />
-
-            {quote && <QuoteSummary quote={quote} currency={currency} stale={quoting} />}
-            {fetchedAt && (
-              <p className="small faint center">
-                Quote from {timeAgo(fetchedAt)}, refreshed automatically. Rates move between quoting and signing.
-              </p>
+                {quoteError && <div className="notice">{quoteError}</div>}
+                {error && <div className="error" role="alert">{error}</div>}
+              </>
             )}
-
-            {quoteError && <div className="notice">{quoteError}</div>}
-            {error && <div className="error" role="alert">{error}</div>}
           </>
         )}
       </div>
 
-      {chainSupported && (
+      {chainSupported && !picker && (
         <div className="footer">
           <button
             className="primary"
             onClick={openReview}
             disabled={busy || verifying || !quote || overBalance || quoting}
           >
-            {verifying ? 'Checking route…' : quoting ? 'Finding a route…' : quote ? 'Review swap' : 'Enter an amount'}
+            {/* Reports which step is actually outstanding. "Enter an amount"
+                while an amount is on screen is what made the earlier failure
+                impossible to diagnose. */}
+            {verifying
+              ? 'Checking route…'
+              : quoting
+                ? 'Finding a route…'
+                : quote
+                  ? 'Review swap'
+                  : !toToken
+                    ? 'Choose a token to receive'
+                    : !amountRaw
+                      ? 'Enter an amount'
+                      : overBalance
+                        ? 'Amount exceeds balance'
+                        : quoteError
+                          ? 'No route for this pair'
+                          : 'Finding a route…'}
           </button>
         </div>
       )}

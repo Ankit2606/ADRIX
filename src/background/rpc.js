@@ -239,12 +239,20 @@ export async function handleRpc(method, params = [], origin) {
       const rawMessage = isAddressFirst ? b : a;
       const account = await requireUnlockedAccount(origin, isAddressFirst ? a : b);
 
+      const decoded = decodeMessage(rawMessage);
+      // A sign-in is not a message, and rendering it as one hides the only
+      // fields that distinguish a real login from a harvested signature.
+      const siwe = signatures.parseSiwe(decoded);
+
       await askUser({
         kind: 'personalSign',
         origin,
         account,
-        message: decodeMessage(rawMessage),
+        chainId,
+        message: decoded,
         raw: rawMessage,
+        siwe,
+        siweCheck: siwe ? signatures.verifySiwe(siwe, { origin, account, chainId }) : null,
       });
       await permissions.touch(origin, 'personalSign', { account });
 

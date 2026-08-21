@@ -105,6 +105,7 @@ export async function getQuote({
   fromAmountRaw,
   fromAddress,
   slippage = DEFAULT_SLIPPAGE,
+  gasRefuelRaw = null,
 }) {
   if (!fromAddress) throw new Error('No account selected.');
   if (!fromAmountRaw || BigInt(fromAmountRaw) <= 0n) throw new Error('Enter an amount greater than zero.');
@@ -120,6 +121,14 @@ export async function getQuote({
     fromAmount: String(fromAmountRaw),
     slippage: String(bounded),
   });
+
+  // Cross-chain gas: part of what is being sent is converted into the
+  // destination chain's native coin and delivered alongside it. This is the
+  // answer to arriving on a new chain with tokens and no way to move them —
+  // the classic bridging dead end, where the funds are there and unusable.
+  if (gasRefuelRaw && BigInt(gasRefuelRaw) > 0n) {
+    params.set('fromAmountForGas', String(gasRefuelRaw));
+  }
 
   const raw = await getJson(`${API}/quote?${params}`);
   if (!raw?.transactionRequest) {
@@ -170,6 +179,13 @@ export async function getQuote({
     })),
 
     slippage: bounded,
+    gasRefuelRaw: gasRefuelRaw ? String(gasRefuelRaw) : null,
+    // The delivered gas leg, when one was requested. Reported separately from
+    // route fees because it is not a cost — it is part of the amount, arriving
+    // in a different form.
+    refuel: (estimate.gasCosts ?? [])
+      .filter((cost) => String(cost.type).toUpperCase() === 'SEND')
+      .map((cost) => ({ amount: cost.amount, amountUsd: Number(cost.amountUSD) || null, token: cost.token?.symbol ?? null }))[0] ?? null,
     durationSeconds: Number(estimate.executionDuration) || null,
     steps: (raw.includedSteps ?? []).map((step) => ({
       tool: step.toolDetails?.name ?? step.tool,

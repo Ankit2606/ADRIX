@@ -197,6 +197,32 @@ export default function Settings({ state, go, refresh }) {
         <EncryptedBackup refresh={refresh} />
 
         <section className="card">
+          <div className="between">
+            <h2>Accounting</h2>
+            <button className="link accent" onClick={() => go('accounting')}>
+              open
+            </button>
+          </div>
+          <p className="small">
+            Portfolio value over time, cost basis, and a per-disposal CSV for tax. Built only from what this wallet
+            witnessed — it says how much of the picture is missing rather than filling the gaps in.
+          </p>
+        </section>
+
+        <section className="card">
+          <div className="between">
+            <h2>Advanced</h2>
+            <button className="link accent" onClick={() => go('advanced')}>
+              open
+            </button>
+          </div>
+          <p className="small">
+            EIP-7702 delegation, air-gapped QR signing, splitting your recovery phrase into shares, and passkeys. Each
+            changes how the wallet is controlled — read what each one says before using it.
+          </p>
+        </section>
+
+        <section className="card">
           <h2>Not implemented yet</h2>
           <p className="small">
             These appear on the roadmap but have no working implementation. They are listed so the gap is visible
@@ -205,9 +231,10 @@ export default function Settings({ state, go, refresh }) {
           <ul className="small faint plain-list">
             <li>WalletConnect pairing</li>
             <li>Session keys and spending limits</li>
-            <li>Social recovery guardians</li>
-            <li>Hardware wallet signing</li>
-            <li>Swap, bridge, and fiat on-ramp routing</li>
+            <li>On-chain guardian recovery — splitting your phrase into shares is offered instead, under Advanced</li>
+            <li>USB hardware wallet signing — air-gapped QR signing is offered instead, under Advanced</li>
+            <li>Passkeys controlling an account — enrolment works, but no account can verify them yet</li>
+            <li>Deploying a smart account — existing ones can be used, new ones cannot be created here</li>
           </ul>
         </section>
 

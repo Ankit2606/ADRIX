@@ -5,13 +5,16 @@ import { BackBar, EmptyState } from '../components/common.jsx';
 import {
   NATIVE_TOKEN,
   BridgeTracker,
+  PriceImpactWarning,
   QuoteSummary,
   QuoteVerification,
   SlippageControl,
   SwapFeeControls,
-  TokenSelect,
+  TokenPicker,
+  TokenTrigger,
   fmtUnits,
   useQuote,
+  useTokenList,
 } from '../components/swap.jsx';
 
 /**
@@ -39,9 +42,14 @@ export default function Bridge({ state, go }) {
   const [gasInfo, setGasInfo] = useState(null);
   const [preset, setPreset] = useState('market');
   const [hash, setHash] = useState('');
+  const [picker, setPicker] = useState(null);
+  const [refuel, setRefuel] = useState(false);
+  const [destGas, setDestGas] = useState(null);
   const { busy, error, run } = useAsyncAction();
 
   const currency = portfolio?.currency ?? state.currency ?? 'usd';
+  const fromList = useTokenList(fromChainId);
+  const toList = useTokenList(toChainId);
 
   useEffect(() => {
     call('GET_PORTFOLIO').then(setPortfolio).catch(() => {});
@@ -56,19 +64,47 @@ export default function Bridge({ state, go }) {
       .catch(() => setChains([]));
   }, [state.chainId, state.selected]);
 
+  // Whether the destination chain can actually be transacted on after arrival.
+  useEffect(() => {
+    if (!toChainId) return;
+    call('DESTINATION_GAS', { chainId: toChainId })
+      .then((info) => {
+        setDestGas(info);
+        // Defaulted on where the user would otherwise arrive stranded — tokens
+        // present, no gas to move them.
+        if (info.stranded) setRefuel(true);
+      })
+      .catch(() => setDestGas(null));
+  }, [toChainId, state.selected]);
+
+  // Decimals come from the token list, not the wallet — the picker offers every
+  // token the aggregator supports and only a few are tracked here.
   const sellAsset = useMemo(() => {
-    if (!portfolio || fromChainId !== state.chainId) return null;
-    if (fromToken?.toLowerCase() === NATIVE_TOKEN.toLowerCase()) {
-      return {
-        symbol: portfolio.native?.symbol,
-        decimals: 18,
-        balance: portfolio.native?.balance,
-        raw: portfolio.native?.raw,
-        native: true,
-      };
-    }
-    return portfolio.tokens?.find((t) => t.address?.toLowerCase() === fromToken?.toLowerCase()) ?? null;
-  }, [portfolio, fromToken, fromChainId, state.chainId]);
+    const meta = fromList.find(fromToken);
+    const isNative = fromToken?.toLowerCase() === NATIVE_TOKEN.toLowerCase();
+    const onCurrentChain = fromChainId === state.chainId;
+
+    const held = !onCurrentChain
+      ? { balance: null, raw: null }
+      : isNative
+        ? { balance: portfolio?.native?.balance, raw: portfolio?.native?.raw }
+        : (() => {
+            const t = portfolio?.tokens?.find((x) => x.address?.toLowerCase() === fromToken?.toLowerCase());
+            return t ? { balance: t.balance, raw: t.raw } : { balance: null, raw: null };
+          })();
+
+    if (!meta && !isNative) return null;
+    return {
+      symbol: meta?.symbol ?? portfolio?.native?.symbol ?? '',
+      decimals: meta?.decimals ?? 18,
+      priceUSD: meta?.priceUSD ? Number(meta.priceUSD) : null,
+      logoURI: meta?.logoURI ?? null,
+      native: isNative,
+      ...held,
+    };
+  }, [fromList, fromToken, portfolio, fromChainId, state.chainId]);
+
+  const buyAsset = useMemo(() => toList.find(toToken), [toList, toToken]);
 
   const amountRaw = useMemo(() => {
     if (!amount) return null;
@@ -80,6 +116,14 @@ export default function Bridge({ state, go }) {
     }
   }, [amount, sellAsset]);
 
+  // Roughly 2% of the amount, which is enough for a handful of transfers on any
+  // chain without meaningfully denting what is being bridged.
+  const refuelRaw = useMemo(() => {
+    if (!refuel || !amountRaw) return null;
+    const slice = (BigInt(amountRaw) * 2n) / 100n;
+    return slice > 0n ? slice.toString() : null;
+  }, [refuel, amountRaw]);
+
   const overBalance = Boolean(amountRaw && sellAsset?.raw && BigInt(amountRaw) > BigInt(sellAsset.raw));
   const sameChain = fromChainId === toChainId;
   // Signing happens on the source chain, so the wallet has to be on it.
@@ -87,9 +131,11 @@ export default function Bridge({ state, go }) {
 
   const { quote, error: quoteError, loading: quoting, fetchedAt } = useQuote({
     enabled: Boolean(amountRaw && toToken && fromToken && !sameChain && !overBalance && !wrongNetwork),
-    params: { fromChainId, toChainId, fromToken, toToken, fromAmountRaw: amountRaw, slippage },
+    params: { fromChainId, toChainId, fromToken, toToken, fromAmountRaw: amountRaw, slippage, gasRefuelRaw: refuelRaw },
     intervalMs: 30_000,
   });
+
+  const balanceKnown = sellAsset?.raw != null;
 
   const openReview = () =>
     run(async () => {
@@ -291,6 +337,23 @@ export default function Bridge({ state, go }) {
     <div className="screen">
       <BackBar title="Bridge" onBack={() => go('home')} />
       <div className="scroll pad stack">
+        {picker ? (
+          <TokenPicker
+            chainId={picker === 'from' ? fromChainId : toChainId}
+            chainName={chainName(picker === 'from' ? fromChainId : toChainId)}
+            tokens={picker === 'from' ? fromList.tokens : toList.tokens}
+            loading={picker === 'from' ? fromList.loading : toList.loading}
+            title={picker === 'from' ? 'Send' : 'Receive'}
+            balances={picker === 'from' && fromChainId === state.chainId ? portfolio?.tokens : []}
+            onClose={() => setPicker(null)}
+            onPick={(token) => {
+              if (picker === 'from') setFromToken(token.address);
+              else setToToken(token.address);
+              setPicker(null);
+            }}
+          />
+        ) : (
+        <>
         <div className="card">
           <div className="row2">
             <label className="field">
@@ -363,7 +426,7 @@ export default function Bridge({ state, go }) {
               aria-invalid={overBalance}
               aria-label="Amount to bridge"
             />
-            <TokenSelect chainId={fromChainId} value={fromToken} onChange={setFromToken} label="asset" />
+            <TokenTrigger token={sellAsset} label="asset" loading={fromList.loading} onOpen={() => setPicker('from')} />
           </div>
           {overBalance && <div className="error">That is more than the {sellAsset?.symbol} available.</div>}
         </div>
@@ -374,12 +437,47 @@ export default function Bridge({ state, go }) {
             <span className="mono swap-output">
               {quote ? trimAmount(fmtUnits(quote.toAmountRaw, quote.toToken?.decimals), 6) : quoting ? '…' : '0.0'}
             </span>
-            <TokenSelect chainId={toChainId} value={toToken} onChange={setToToken} label="asset" />
+            <TokenTrigger token={buyAsset} label="asset" loading={toList.loading} onOpen={() => setPicker('to')} />
           </div>
           {quote?.toAmountUsd != null && <span className="small faint">≈ {formatFiat(quote.toAmountUsd, currency)}</span>}
         </div>
 
-        <SlippageControl value={slippage} onChange={setSlippage} />
+        {/* Cross-chain gas. Arriving with tokens and no native coin is the
+            classic bridging dead end: the funds are visibly there and cannot
+            be moved, and fixing it afterwards needs a second bridge. */}
+        <div className="card">
+          <label className="check-line">
+            <input type="checkbox" checked={refuel} onChange={(e) => setRefuel(e.target.checked)} />
+            <span className="item-main">
+              <span>Also deliver gas on {chainName(toChainId)}</span>
+              <span className="small faint">
+                Converts about 2% of the amount into {destGas?.symbol ?? 'the destination coin'} so the funds are
+                usable the moment they land.
+              </span>
+            </span>
+          </label>
+
+          {destGas?.stranded && (
+            <div className="notice">
+              This account holds almost no {destGas.symbol} on {chainName(toChainId)}. Without gas delivered alongside,
+              anything bridged there cannot be moved until you fund it separately.
+            </div>
+          )}
+
+          {quote?.refuel && (
+            <div className="between small">
+              <span className="faint">Gas being delivered</span>
+              <span className="mono">
+                {quote.refuel.amountUsd != null ? formatFiat(quote.refuel.amountUsd, currency) : '--'}
+                {quote.refuel.token ? ` of ${quote.refuel.token}` : ''}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <SlippageControl value={slippage} onChange={setSlippage} quote={quote} symbol={buyAsset?.symbol} />
+
+        <PriceImpactWarning quote={quote} />
 
         {quote && <QuoteSummary quote={quote} currency={currency} stale={quoting} />}
         {fetchedAt && (
@@ -388,17 +486,39 @@ export default function Bridge({ state, go }) {
 
         {quoteError && <div className="notice">{quoteError}</div>}
         {error && <div className="error" role="alert">{error}</div>}
+        </>
+        )}
       </div>
 
+      {!picker && (
       <div className="footer">
         <button
           className="primary"
           onClick={openReview}
           disabled={busy || verifying || !quote || overBalance || wrongNetwork || quoting}
         >
-          {verifying ? 'Checking route…' : quoting ? 'Finding a route…' : quote ? 'Review bridge' : 'Enter an amount'}
+          {/* Names the step that is actually outstanding, rather than always
+              blaming a missing amount. */}
+          {verifying
+            ? 'Checking route…'
+            : quoting
+              ? 'Finding a route…'
+              : quote
+                ? 'Review bridge'
+                : wrongNetwork
+                  ? `Switch to ${chainName(fromChainId)}`
+                  : !toToken
+                    ? 'Choose a token to receive'
+                    : !amountRaw
+                      ? 'Enter an amount'
+                      : overBalance
+                        ? 'Amount exceeds balance'
+                        : quoteError
+                          ? 'No route for this pair'
+                          : 'Finding a route…'}
         </button>
       </div>
+      )}
     </div>
   );
 }

@@ -16,6 +16,9 @@ import Buy from './views/Buy.jsx';
 import BatchSend from './views/BatchSend.jsx';
 import Search from './views/Search.jsx';
 import SmartAccount from './views/SmartAccount.jsx';
+import Advanced from './views/Advanced.jsx';
+import Earn from './views/Earn.jsx';
+import Accounting from './views/Accounting.jsx';
 
 const VIEWS = {
   send: Send,
@@ -30,6 +33,9 @@ const VIEWS = {
   settings: Settings,
   search: Search,
   smartAccount: SmartAccount,
+  advanced: Advanced,
+  earn: Earn,
+  accounting: Accounting,
 };
 
 export default function App() {

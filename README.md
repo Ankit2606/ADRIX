@@ -34,6 +34,15 @@ Content scripts do not inject into `file://` pages, so the demo has to be served
   payloads as an owner (EIP-712, with the pre/post-1.3.0 domain difference
   handled), shares signatures through the Safe Transaction Service, and executes
   once the threshold is met
+- EIP-7702 delegation: points an existing account at contract code, with the
+  target inspected first and an unrecognised one treated as hostile; atomic
+  batching through the delegated code; revocation by delegating to the zero address
+- Air-gapped QR signing in Keystone UR format — bytewords, CRC-32, and a CBOR
+  subset implemented from the specification, single-frame only, with multi-part
+  animated codes detected and refused rather than misread
+- Recovery-phrase splitting via Shamir secret sharing over GF(256), any T of N,
+  with a set identifier that stops shares from different splits silently
+  combining into a valid-looking phrase for the wrong wallet
 - ERC-4337 smart accounts: user operations built for EntryPoint v0.7, priced by
   the bundler, optionally sponsored via an ERC-7677 paymaster, signed by whichever
   owner key the wallet holds, and tracked to inclusion
@@ -48,6 +57,14 @@ Content scripts do not inject into `file://` pages, so the demo has to be served
 - Each endpoint is verified independently before it is saved, and the health
   panel shows which one is currently serving requests
 
+**Earn**
+- Direct staking deposits into Lido and Rocket Pool — the protocol's own deposit
+  call, so no slippage and no spread, with the rebasing/appreciating distinction
+  explained rather than left to surprise you
+- Position tracking for any ERC-4626 vault without ADRIX knowing the protocol,
+  plus Uniswap V3 liquidity and liquid-staking positions. No APR figures are
+  shown: those need an off-chain source this wallet does not have
+
 **Swap and bridge**
 - Real routing through the LI.FI aggregator — same-chain swaps and cross-chain
   bridges, no API key, no integrator fee taken by ADRIX
@@ -55,6 +72,10 @@ Content scripts do not inject into `file://` pages, so the demo has to be served
   and then simulated locally, so the wallet forms its own view of what the
   calldata does rather than trusting the server that wrote it
 - Approvals are for the exact amount being traded, never unlimited
+- Slippage stated as what it costs — the worst case in the output token — and
+  refused when the route's own price impact already exceeds it
+- Cross-chain gas: a slice of a bridged amount can be delivered as the
+  destination chain's native coin, so arriving tokens are not stranded
 - Minimum-received is given more weight than the headline rate, price impact is
   shown, and slippage above 1% says what it costs you
 - Bridges are tracked to arrival on the destination chain, because the source
@@ -184,8 +205,16 @@ Real wallets carry years of adversarial hardening. This does not have:
   served by the shipped publicnode endpoints; nodes without it fall back to native-only
   tracing or a bare revert check, and the prompt says which it got. There is no third-party
   simulation backend to fall back on.
-- **No hardware wallet signing, no Snaps, no WalletConnect, no EIP-7702.** Hardware accounts
-  can be tracked but not signed for.
+- **No USB hardware wallet signing, no Snaps, no WalletConnect.** Air-gapped QR signing
+  covers the offline-signer case instead; USB devices are tracked but not signed for.
+- **Passkeys cannot control anything yet.** Enrolment, P-256 key extraction, assertion
+  production, and RIP-7212 precompile detection all work, but a passkey can only control a
+  smart account that verifies WebAuthn on chain, and ADRIX cannot deploy one.
+- **Share splitting is secret sharing, not MPC.** The phrase is reconstructed in memory on
+  one device at recovery time. True threshold signing never assembles the key and needs live
+  counterparties, which an extension does not have.
+- **EIP-7702 delegation is the most dangerous action here.** It applies to the address
+  already holding funds, and the delegate can move all of it until revoked.
 - **ERC-4337 support requires a bundler**, which is third-party infrastructure. Public keyless
   ones are offered as defaults. Only EntryPoint v0.7 is implemented, only the
   `execute(address,uint256,bytes)` account convention is understood, and counterfactual
@@ -225,6 +254,19 @@ confirmation on onboarding, a spending-approval warning on `approve` calls with 
 amounts, transaction simulation, then a real audit before it touches mainnet value.
 
 ## Changelog
+
+**0.2.9** - fixed swap quoting for any token outside the wallet's tracked list (decimals now
+come from the aggregator's token metadata, not the portfolio, which is why the receive field
+sat at 0.0); rebuilt the token picker as a full-width panel with chain, price, balance, and
+verification per row, fixing the horizontal overflow; price-impact warnings and
+slippage-versus-impact checking; cross-chain gas delivery on bridges; direct Lido and Rocket
+Pool staking; ERC-4626 position tracking.
+
+**0.2.8** - EIP-7702 delegation with target inspection, atomic batching, and revocation;
+air-gapped QR signing (UR/bytewords/CBOR implemented against BCR-2020-012 and verified with
+its own test vector); Shamir splitting of the recovery phrase with set-identifier binding;
+passkey enrolment and P-256 assertion production with honest reporting of what is still
+missing before one can authorise a transaction.
 
 **0.2.7** - Safe multisig support (chain-read state, EIP-712 SafeTx signing across contract
 versions, Transaction Service coordination, threshold execution with Safe error-code

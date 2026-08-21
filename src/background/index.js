@@ -19,10 +19,19 @@ import * as security from './security.js';
 import * as simulation from './simulation.js';
 import * as swap from './swap.js';
 import * as onramp from './onramp.js';
+import * as defi from './defi.js';
+import * as ledger from './ledger.js';
 import * as batch from './batch.js';
 import * as safe from './safe.js';
 import * as aa from './erc4337.js';
 import * as watcher from './watcher.js';
+import * as delegation from './delegation.js';
+import * as ur from './ur.js';
+import * as sharding from './sharding.js';
+// Only the storage- and chain-backed half is used here. Enrolment and signing
+// need navigator.credentials, which a service worker does not have, so the UI
+// calls those directly.
+import * as webauthn from './webauthn.js';
 import { globalSearch } from './search.js';
 import { handleRpc } from './rpc.js';
 import { broadcastEvent, notifyUi } from './events.js';
@@ -152,6 +161,21 @@ async function getState() {
   };
 }
 
+/**
+ * The fiat price of one unit, right now, for the cost-basis ledger.
+ *
+ * Best-effort: a missing price is recorded as unknown rather than guessed,
+ * because an invented acquisition price silently becomes reported profit.
+ */
+async function currentPrice({ native = false, address = null, chainId = null } = {}) {
+  const chain = chainId ?? (await networks.getChainId());
+  const currency = await prices.getCurrency();
+  if (native) return (await prices.nativeQuote(chain, currency))?.price ?? null;
+  if (!address) return null;
+  const map = await prices.tokenPrices(chain, [address], currency);
+  return map[address.toLowerCase()] ?? null;
+}
+
 /** Attaches live fiat values to one chain's native balance and token list. */
 async function priceChain(chainId, nativeBalanceStr, tokenList, currency) {
   const [nativeInfo, tokenMap] = await Promise.all([
@@ -219,6 +243,10 @@ async function getPortfolio() {
 
   const nativeBalanceStr = formatEther(balance);
   const priced = await priceChain(chainId, nativeBalanceStr, tokenList, currency);
+
+  // One point on the value curve. Throttled to hourly inside, so calling it on
+  // every 15-second refresh is free.
+  ledger.recordSnapshot({ address, chainId, totalFiat: priced.total, currency }).catch(() => {});
 
   // Floors are read from cache only. Fetching them here would put a
   // third-party round trip per collection inside the 15s home refresh; the NFT
@@ -464,8 +492,34 @@ const handlers = {
   // --- swap and bridge -----------------------------------------------------
   SWAP_CHAINS: async () => ({ chains: await swap.supportedChains() }),
   SWAP_TOKENS: ({ chainId }) => swap.swapTokens(chainId).then((tokenList) => ({ tokens: tokenList })),
-  SWAP_QUOTE: async (payload) =>
-    swap.getQuote({ ...payload, fromAddress: payload.fromAddress ?? (await keyring.getSelected()) }),
+  SWAP_QUOTE: async ({ fromChainId, toChainId, fromToken, toToken, fromAmountRaw, slippage, gasRefuelRaw, fromAddress }) =>
+    swap.getQuote({
+      fromChainId,
+      toChainId,
+      fromToken,
+      toToken,
+      fromAmountRaw,
+      slippage,
+      gasRefuelRaw,
+      fromAddress: fromAddress ?? (await keyring.getSelected()),
+    }),
+  /** Native balance on the destination chain, to decide whether refuel is needed. */
+  DESTINATION_GAS: async ({ chainId }) => {
+    const address = await keyring.getSelected();
+    const provider = await networks.getProvider(chainId);
+    const [balance, net] = await Promise.all([
+      provider.getBalance(address).catch(() => null),
+      networks.getNetwork(chainId),
+    ]);
+    return {
+      chainId,
+      symbol: net.symbol,
+      raw: balance != null ? balance.toString() : null,
+      // A balance too small to cover a basic transfer is the condition that
+      // makes arriving tokens unusable, so that is the threshold reported.
+      stranded: balance != null && balance < 300_000_000_000_000n,
+    };
+  },
   SWAP_ALLOWANCE: async ({ chainId, token, spender, amountRaw }) =>
     swap.checkSwapAllowance({ chainId, token, spender, amountRaw, owner: await keyring.getSelected() }),
   SWAP_APPROVE: async ({ chainId, token, spender, amountRaw, fees, gas }) => {
@@ -484,6 +538,35 @@ const handlers = {
     swap.verifyQuote(quote, { from: await keyring.getSelected(), allowanceReady }),
   SWAP_EXECUTE: async ({ quote, fees, gas }) => {
     const hash = await swap.executeQuote({ quote, fees, gas, from: await keyring.getSelected() });
+    // A swap is a disposal and an acquisition at once, and the aggregator has
+    // already priced both legs — so the ledger gets a complete, priced pair
+    // rather than a gap it can never fill in afterwards.
+    await ledger
+      .recordEntry({
+        kind: 'dispose',
+        symbol: quote.fromToken?.symbol,
+        address: quote.fromToken?.address,
+        chainId: quote.fromChainId,
+        quantity: formatUnits(quote.fromAmountRaw, quote.fromToken?.decimals ?? 18),
+        unitPrice: quote.fromToken?.priceUSD ?? null,
+        source: 'swap',
+        ref: hash,
+        note: `Swapped for ${quote.toToken?.symbol}`,
+      })
+      .catch(() => {});
+    await ledger
+      .recordEntry({
+        kind: 'acquire',
+        symbol: quote.toToken?.symbol,
+        address: quote.toToken?.address,
+        chainId: quote.toChainId,
+        quantity: formatUnits(quote.toAmountRaw, quote.toToken?.decimals ?? 18),
+        unitPrice: quote.toToken?.priceUSD ?? null,
+        source: 'swap',
+        ref: hash,
+        note: `Swapped from ${quote.fromToken?.symbol}`,
+      })
+      .catch(() => {});
     return { hash };
   },
   BRIDGE_STATUS: ({ txHash, fromChainId, toChainId, tool }) =>
@@ -513,6 +596,11 @@ const handlers = {
   ONRAMP_RECORD: async (payload) =>
     onramp.recordHandoff({ ...payload, address: await keyring.getSelected(), chainId: await networks.getChainId() }),
   ONRAMP_CLEAR: () => onramp.clearHandoffs(),
+  OFFRAMP_PROVIDERS: async ({ chainId }) => ({
+    providers: await onramp.listSellProviders(chainId ?? (await networks.getChainId())),
+  }),
+  OFFRAMP_URL: async ({ providerId, symbol, fiatCurrency }) =>
+    onramp.buildOfframpUrl({ providerId, chainId: await networks.getChainId(), symbol, fiatCurrency }),
 
   // --- batch transfers -----------------------------------------------------
   BATCH_PREPARE: async ({ transfers, tokenAddress }) =>
@@ -570,14 +658,101 @@ const handlers = {
   AA_SEND: ({ prepared }) => aa.sendUserOperation({ prepared }),
   AA_STATUS: ({ userOpHash, chainId }) => aa.userOperationStatus({ userOpHash, chainId }),
 
+  // --- EIP-7702 delegation -------------------------------------------------
+  DELEGATION_SUPPORT: ({ chainId }) => delegation.supportsDelegation(chainId),
+  GET_DELEGATION: async ({ address, chainId }) =>
+    delegation.getDelegation(address ?? (await keyring.getSelected()), chainId),
+  INSPECT_DELEGATE: ({ target, chainId }) => delegation.inspectDelegate(target, chainId),
+  SET_DELEGATION: async ({ target, fees, gas }) => {
+    const result = await delegation.setDelegation({ account: await keyring.getSelected(), target, fees, gas });
+    notifyUi();
+    return result;
+  },
+  REVOKE_DELEGATION: async ({ fees, gas }) => {
+    const result = await delegation.revokeDelegation({ account: await keyring.getSelected(), fees, gas });
+    notifyUi();
+    return result;
+  },
+  TRUST_DELEGATE: ({ target, chainId, label }) => delegation.trustDelegate(target, chainId, label),
+  UNTRUST_DELEGATE: ({ target, chainId }) => delegation.untrustDelegate(target, chainId),
+  LIST_TRUSTED_DELEGATES: async () => ({ delegates: await delegation.listTrustedDelegates() }),
+  SIMULATE_DELEGATED_BATCH: async ({ calls }) =>
+    delegation.simulateDelegatedBatch({ account: await keyring.getSelected(), calls }),
+  EXECUTE_DELEGATED_BATCH: async ({ calls, fees, gas }) =>
+    delegation.executeBatchViaDelegation({ account: await keyring.getSelected(), calls, fees, gas }),
+
+  // --- air-gapped QR signing -----------------------------------------------
+  UR_BUILD_REQUEST: ({ dataHex, dataType, chainId, address, derivationPath, origin }) =>
+    ur.buildSignRequest({ dataHex, dataType, chainId, address, derivationPath, origin }),
+  UR_PARSE_SIGNATURE: ({ text }) => ur.parseSignature(text),
+  UR_PARSE_HDKEY: ({ text }) => ur.parseHdKey(text),
+
+  // --- share splitting -----------------------------------------------------
+  SPLIT_PHRASE: async ({ password, vaultId, threshold, total }) => {
+    // Re-derived from the vault behind a password check rather than accepted
+    // from the UI: a phrase travelling through a message just to be split is a
+    // phrase in one more place than it needs to be.
+    const phrase = await keyring.revealVaultMnemonic(vaultId ?? null, password);
+    return sharding.splitPhrase({ phrase, threshold, total });
+  },
+  COMBINE_SHARES: ({ shares }) => sharding.combineShares(shares),
+  INSPECT_SHARE: ({ text }) => sharding.inspectShare(text),
+
+  // --- passkeys ------------------------------------------------------------
+  PASSKEY_READINESS: ({ chainId }) => webauthn.passkeyReadiness(chainId),
+  PASSKEY_LIST: async () => ({ passkeys: await webauthn.listPasskeys() }),
+  PASSKEY_REMOVE: ({ id }) => webauthn.removePasskey(id),
+  CHECK_P256: ({ chainId }) => webauthn.checkP256Support(chainId),
+
   // --- notifications -------------------------------------------------------
   NOTIFICATION_PREFS: () => watcher.watchStatus(),
   SET_NOTIFICATION_PREFS: ({ prefs }) => watcher.setNotificationPrefs(prefs),
   RESET_WATCH: () => watcher.resetWatch(),
   POLL_INCOMING: () => watcher.pollIncoming(),
 
+  // --- staking and DeFi positions ------------------------------------------
+  STAKING_VENUES: async ({ chainId }) => defi.listStakingVenues(await keyring.getSelected(), chainId),
+  QUOTE_STAKE: async ({ venueId, amountWei }) =>
+    defi.quoteStake({ venueId, amountWei, from: await keyring.getSelected() }),
+  STAKE: async ({ venueId, amountWei, fees, gas }) =>
+    defi.stake({ venueId, amountWei, fees, gas, from: await keyring.getSelected() }),
+  LIST_POSITIONS: async ({ chainId }) => defi.listPositions(await keyring.getSelected(), chainId),
+  IDENTIFY_POSITION: async ({ address, chainId }) =>
+    defi.identifyPosition(address, await keyring.getSelected(), chainId),
+  TRACK_POSITION: async ({ address, chainId, label }) => {
+    const result = await defi.trackPosition({ address, chainId, label });
+    notifyUi();
+    return result;
+  },
+  UNTRACK_POSITION: async ({ address, chainId }) => {
+    const result = await defi.untrackPosition({ address, chainId });
+    notifyUi();
+    return result;
+  },
+
   // --- prices --------------------------------------------------------------
   PRICE_STATE: () => prices.priceState(),
+
+  // --- portfolio history and cost basis ------------------------------------
+  VALUE_HISTORY: async ({ days }) => ledger.valueHistory({ address: await keyring.getSelected(), days }),
+  CLEAR_VALUE_HISTORY: () => ledger.clearHistory(),
+  LIST_LEDGER: async () => ({ entries: await ledger.listEntries(), methods: ledger.LOT_METHODS }),
+  ADD_LEDGER_ENTRY: async ({ entry }) => {
+    const row = await ledger.recordEntry(entry);
+    notifyUi();
+    return row ?? { duplicate: true };
+  },
+  REMOVE_LEDGER_ENTRY: ({ id }) => ledger.removeEntry(id),
+  IMPORT_LEDGER: async () => {
+    const result = await ledger.importFromActivity();
+    notifyUi();
+    return result;
+  },
+  DISPOSAL_REPORT: ({ method, year }) => ledger.buildDisposalReport({ method, year }),
+  DISPOSAL_CSV: async ({ method, year }) => ({
+    csv: ledger.disposalCsv(await ledger.buildDisposalReport({ method, year })),
+  }),
+  CLEAR_LEDGER: () => ledger.clearLedger(),
 
   // --- security lists ------------------------------------------------------
   GET_SECURITY_LISTS: () => security.getSecurityLists(),
@@ -873,7 +1048,11 @@ const handlers = {
   LIST_PENDING: async () => txs.listPending(await keyring.getSelected()),
   ESTIMATE_GAS: ({ request }) => txs.estimateGas(request),
   SEND_TRANSACTION: async ({ request }) => {
-    const hash = await txs.sendTransaction(request);
+    // The price is captured now, not at report time. Looking it up later gives
+    // today's price, which would make every historic disposal wrong by however
+    // much the market has moved since.
+    const unitPrice = await currentPrice({ native: true }).catch(() => null);
+    const hash = await txs.sendTransaction({ ...request, meta: { ...(request.meta ?? {}), unitPrice } });
     await contacts.recordContactUse(request.to);
     return { hash };
   },
@@ -928,7 +1107,12 @@ const handlers = {
       fees,
       gas,
       nonce,
-      meta: { tokenSymbol: token.symbol, tokenAmount: String(amount), tokenTo: to },
+      meta: {
+        tokenSymbol: token.symbol,
+        tokenAmount: String(amount),
+        tokenTo: to,
+        unitPrice: await currentPrice({ address: token.address }).catch(() => null),
+      },
     });
     await contacts.recordContactUse(to);
     return { hash };

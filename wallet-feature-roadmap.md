@@ -103,14 +103,10 @@ Updated: 17 Aug 2026
 - Gas sponsorship / paymaster support
 - Bundler support for ERC-4337
 - Push notifications for incoming/outgoing transactions
-
-
 - **EIP-7702 delegation support** — the big gap here. Post-Pectra, plain EOAs can delegate to smart-contract code, which is how most wallets are now delivering batching, sponsorship, and session keys without migrating users to a new 4337 address. Your list jumps straight to 4337/bundlers and skips the path most users will actually take.
 - **Passkey / WebAuthn signing** (secp256r1, EIP-7212) for smart accounts
 - **MPC / threshold-signature accounts** as an alternative to seed-phrase custody
 - **Air-gapped QR signing** (Keystone/UR format) alongside USB hardware wallets
-
-- **MEV protection / private transaction RPC** (Flashbots Protect–style default for swaps)
 - **Slippage settings + price impact warning** on swaps
 - **Cross-chain gas payment / pay fees in stablecoins**
 - **Staking and liquid-staking integration**
@@ -118,10 +114,7 @@ Updated: 17 Aug 2026
 - **Portfolio value chart over time** with cost basis
 - **Tax / accounting export** (per-disposal CSV, not just raw activity)
 - **Sign-In With Ethereum (EIP-4361)** with a proper human-readable SIWE prompt
-- **Encrypted cloud backup** (iCloud / Google Drive) as an optional recovery path
-- **Multi-device sync** for settings, contacts, custom tokens, and account names
 - **Fiat off-ramp** (you have on-ramp only)
-- **Simulation fallback provider** — self-hosted `eth_simulateV1` plus a third-party fallback so simulation degrades gracefully instead of disappearing
 
 ---
 
@@ -234,3 +227,7 @@ Your **Advanced** section commits to ERC-4337 (bundlers, paymasters, smart accou
 - WalletConnect support
 - Session keys / spending limits
 - Social recovery or guardian recovery
+- **MEV protection / private transaction RPC** (Flashbots Protect–style default for swaps)
+- **Encrypted cloud backup** (iCloud / Google Drive) as an optional recovery path
+- **Multi-device sync** for settings, contacts, custom tokens, and account names
+- **Simulation fallback provider** — self-hosted `eth_simulateV1` plus a third-party fallback so simulation degrades gracefully instead of disappearing

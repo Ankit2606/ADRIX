@@ -15,6 +15,8 @@ const AMOUNTS = [50, 100, 250, 500];
  * rates, disputes — is between the user and the provider.
  */
 export default function Buy({ state, go }) {
+  const [direction, setDirection] = useState('buy');
+  const [sellProviders, setSellProviders] = useState(null);
   const [providers, setProviders] = useState(null);
   const [handoffs, setHandoffs] = useState([]);
   const [fiatAmount, setFiatAmount] = useState('100');
@@ -31,6 +33,7 @@ export default function Buy({ state, go }) {
     const result = await call('ONRAMP_PROVIDERS', { chainId: state.chainId });
     setProviders(result.providers ?? []);
     setHandoffs(result.handoffs ?? []);
+    setSellProviders((await call('OFFRAMP_PROVIDERS', { chainId: state.chainId }).catch(() => ({}))).providers ?? []);
   };
 
   useEffect(() => {
@@ -124,8 +127,28 @@ export default function Buy({ state, go }) {
 
   return (
     <div className="screen">
-      <BackBar title="Buy crypto" onBack={() => go('home')} />
+      <BackBar title={direction === 'buy' ? 'Buy crypto' : 'Sell crypto'} onBack={() => go('home')} />
       <div className="scroll pad stack">
+        <div className="tabs" role="tablist" aria-label="Direction">
+          <button role="tab" aria-selected={direction === 'buy'} onClick={() => setDirection('buy')}>
+            Buy
+          </button>
+          <button role="tab" aria-selected={direction === 'sell'} onClick={() => setDirection('sell')}>
+            Sell
+          </button>
+        </div>
+
+        {direction === 'sell' ? (
+          <SellFlow
+            providers={sellProviders}
+            state={state}
+            symbol={symbol}
+            fiatCurrency={fiatCurrency}
+            setFiatCurrency={setFiatCurrency}
+            go={go}
+          />
+        ) : (
+        <>
         <div className="card">
           <div className="eyebrow">Receiving</div>
           <div className="between">
@@ -311,7 +334,143 @@ export default function Buy({ state, go }) {
         )}
 
         {error && <div className="error" role="alert">{error}</div>}
+        </>
+        )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Selling back to fiat.
+ *
+ * Structurally different from buying, and the screen says so. Buying sends
+ * crypto to an address this wallet already controls; selling means sending
+ * funds *out*, to an address the provider generates. ADRIX never handles that
+ * address, never pre-fills a send from one, and does not imply it has checked
+ * it — because a spoofed deposit address is an irreversible transfer to
+ * whoever supplied it.
+ */
+function SellFlow({ providers, state, symbol, fiatCurrency, setFiatCurrency, go }) {
+  const [confirming, setConfirming] = useState(null);
+  const { busy, error, run } = useAsyncAction();
+
+  const usable = (providers ?? []).filter((provider) => provider.supported);
+
+  const open = (provider) =>
+    run(async () => {
+      const result = await call('OFFRAMP_URL', { providerId: provider.id, symbol, fiatCurrency });
+      window.open(result.url, '_blank', 'noopener,noreferrer');
+      setConfirming(null);
+    });
+
+  if (confirming) {
+    return (
+      <>
+        <div className="notice danger">
+          <b>Selling means sending funds out of this wallet.</b>
+          <p className="small">
+            {confirming.name} will give you a deposit address to send {symbol} to. Read that address in their
+            interface and check it there — ADRIX does not receive it, cannot verify it, and a transfer to the wrong
+            one cannot be reversed.
+          </p>
+        </div>
+
+        <div className="card">
+          <div className="kv">
+            <span className="kv-key">Selling</span>
+            <span className="kv-value">
+              {symbol} on {state.network?.name}
+            </span>
+          </div>
+          <div className="kv">
+            <span className="kv-key">Paid out in</span>
+            <span className="kv-value">{fiatCurrency}</span>
+          </div>
+          <p className="small faint">
+            The rate, fees, limits, identity checks, and payout timing are all {confirming.name}'s. ADRIX is not a
+            party to the sale and takes no fee.
+          </p>
+        </div>
+
+        {confirming.needsKey && (
+          <div className="notice">
+            {confirming.name} requires an integrator key ADRIX does not ship, so you may land on their generic entry
+            page rather than a prepared sell flow.
+          </div>
+        )}
+
+        {error && <div className="error" role="alert">{error}</div>}
+        <div className="row2">
+          <button className="ghost" onClick={() => setConfirming(null)} disabled={busy}>
+            Cancel
+          </button>
+          <button className="primary" onClick={() => open(confirming)} disabled={busy}>
+            {busy ? 'Opening…' : `Continue to ${confirming.name}`}
+          </button>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div className="card">
+        <div className="eyebrow">Selling from</div>
+        <div className="between">
+          <span className="small">
+            {symbol} on {state.network?.name}
+          </span>
+          <span className="mono small">{shorten(state.selected, 8, 6)}</span>
+        </div>
+        <label className="field">
+          <span>Paid out in</span>
+          <select value={fiatCurrency} onChange={(e) => setFiatCurrency(e.target.value)}>
+            {FIAT.map((code) => (
+              <option key={code} value={code}>
+                {code}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="notice">
+        Unlike buying, a sale needs you to send funds to an address the provider generates. Verify that address in
+        their interface — it is the one step where a mistake is unrecoverable.
+      </div>
+
+      <div className="card">
+        <h2>Providers</h2>
+        {!providers ? (
+          <p className="small faint">Loading…</p>
+        ) : !usable.length ? (
+          <EmptyState
+            icon="↘"
+            title={`No provider sells from ${state.network?.name}`}
+            body="Switch to a major network, or bridge first."
+            action={
+              <button className="ghost" onClick={() => go('networks')}>
+                Switch network
+              </button>
+            }
+          />
+        ) : (
+          <div className="list">
+            {usable.map((provider) => (
+              <button className="item" key={provider.id} onClick={() => setConfirming(provider)}>
+                <div className="item-main">
+                  <span className="item-title">{provider.name}</span>
+                  <span className="item-sub">{provider.hint}</span>
+                </div>
+                <span className="caret" aria-hidden="true">
+                  ›
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </>
   );
 }

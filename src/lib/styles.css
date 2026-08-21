@@ -2812,3 +2812,136 @@ button.nft-card {
 .batch-row:first-of-type {
   border-top: 0;
 }
+
+/* --- token picker ------------------------------------------------------------
+   The picker is a full-width panel, never a flex child of the amount row. Rows
+   use an explicit three-column grid with a minmax(0,1fr) middle so long token
+   names truncate instead of pushing the price column off the popup. */
+.token-picker-panel {
+  min-width: 0;
+}
+
+.token-picker {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+
+.token-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 4px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.token-row:first-child {
+  border-top: 0;
+}
+
+.token-row:hover {
+  background: var(--surface-2);
+}
+
+.token-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.token-row-top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.token-row-symbol {
+  font-size: 13px;
+  font-weight: 640;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-row-badge {
+  flex: 0 0 auto;
+  font-size: 8.5px;
+  padding: 1px 4px;
+}
+
+.token-row-sub,
+.token-row-meta {
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-row-meta {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--faint);
+}
+
+.token-row-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  flex: 0 0 auto;
+  /* Bounded so a long balance cannot squeeze the name column to nothing. */
+  max-width: 34%;
+}
+
+.token-row-balance {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.token-row-price {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+
+/* The amount row must never be the thing that widens the popup. */
+.swap-input {
+  min-width: 0;
+}
+
+.swap-input input,
+.swap-output {
+  min-width: 0;
+}
+
+/* --- value chart -------------------------------------------------------------
+   The sparkline inherits currentColor, so the direction of travel is set by the
+   wrapper rather than by threading a colour prop through the component. */
+.chart-up {
+  color: var(--good);
+}
+
+.chart-down {
+  color: var(--danger);
+}
+
+.chart-up .sparkline,
+.chart-down .sparkline {
+  height: 90px;
+}

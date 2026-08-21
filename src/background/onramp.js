@@ -94,6 +94,97 @@ export const PROVIDERS = [
   },
 ];
 
+/**
+ * Selling back to fiat.
+ *
+ * Structurally riskier than buying, and the difference is worth stating: an
+ * on-ramp sends crypto *to* an address the wallet already controls, so the
+ * worst case of a bad link is a failed purchase. An off-ramp requires sending
+ * crypto *to an address the provider supplies*, and a spoofed or intercepted
+ * deposit address is an irreversible transfer to an attacker.
+ *
+ * ADRIX therefore never handles the deposit address, never pre-fills a send
+ * from one, and says plainly that the address must be read from the provider's
+ * own interface.
+ */
+export const SELL_PROVIDERS = [
+  {
+    id: 'moonpay-sell',
+    name: 'MoonPay',
+    hint: 'Bank transfer and card refunds in most countries.',
+    needsKey: true,
+    codes: { '0x1': 'eth', '0x89': 'matic_polygon', '0xa4b1': 'eth_arbitrum', '0xa': 'eth_optimism', '0x2105': 'eth_base' },
+    build({ chainId, fiatCurrency, apiKey }) {
+      const params = new URLSearchParams();
+      const code = this.codes[chainId];
+      if (code) params.set('baseCurrencyCode', code);
+      if (fiatCurrency) params.set('quoteCurrencyCode', fiatCurrency.toLowerCase());
+      if (apiKey) params.set('apiKey', apiKey);
+      return `https://sell.moonpay.com/?${params}`;
+    },
+  },
+  {
+    id: 'ramp-sell',
+    name: 'Ramp Network',
+    hint: 'Sells to a bank account. Works without an integrator key.',
+    needsKey: false,
+    assetPrefix: { '0x1': 'ETH', '0x89': 'MATIC', '0xa4b1': 'ARBITRUM', '0xa': 'OPTIMISM', '0x2105': 'BASE' },
+    build({ chainId, symbol, fiatCurrency, apiKey }) {
+      const params = new URLSearchParams({ flow: 'offramp' });
+      const prefix = this.assetPrefix[chainId];
+      if (prefix && symbol) params.set('offrampAsset', `${prefix}_${symbol.toUpperCase()}`);
+      if (fiatCurrency) params.set('fiatCurrency', fiatCurrency.toUpperCase());
+      if (apiKey) params.set('hostApiKey', apiKey);
+      return `https://app.ramp.network/?${params}`;
+    },
+  },
+  {
+    id: 'coinbase-sell',
+    name: 'Coinbase',
+    hint: 'Straightforward if you already hold a Coinbase account.',
+    needsKey: false,
+    networks: { '0x1': 'ethereum', '0x89': 'polygon', '0xa4b1': 'arbitrum', '0xa': 'optimism', '0x2105': 'base' },
+    build({ chainId, symbol }) {
+      const params = new URLSearchParams();
+      const network = this.networks[chainId];
+      if (network && symbol) params.set('assets', JSON.stringify([symbol.toUpperCase()]));
+      return `https://pay.coinbase.com/v3/sell/input?${params}`;
+    },
+  },
+];
+
+export async function listSellProviders(chainId) {
+  const keys = await read();
+  return SELL_PROVIDERS.map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    hint: provider.hint,
+    needsKey: Boolean(provider.needsKey),
+    hasKey: Boolean(keys[provider.id]),
+    supported: Boolean(
+      provider.networks?.[chainId] ?? provider.codes?.[chainId] ?? provider.assetPrefix?.[chainId]
+    ),
+  }));
+}
+
+export async function buildOfframpUrl({ providerId, chainId, symbol, fiatCurrency }) {
+  const provider = SELL_PROVIDERS.find((entry) => entry.id === providerId);
+  if (!provider) throw new Error('Unknown provider.');
+
+  const keys = await read();
+  const url = provider.build({ chainId, symbol, fiatCurrency, apiKey: keys[provider.id] });
+
+  return {
+    url,
+    provider: provider.name,
+    needsKey: Boolean(provider.needsKey) && !keys[provider.id],
+    // Deliberately no wallet address in the URL. A sell flow asks the user to
+    // send funds out, and the address that matters is the provider's — which
+    // ADRIX must not appear to vouch for.
+    sendsFunds: true,
+  };
+}
+
 /** Providers that can actually deliver to the given chain, with their status. */
 export async function listProviders(chainId) {
   const keys = await read();

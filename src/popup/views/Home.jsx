@@ -249,6 +249,7 @@ export default function Home({ state, go, refresh, params }) {
             ['swap', '⇌', 'Swap'],
             ['bridge', '⇄', 'Bridge'],
             ['buy', '＋', 'Buy'],
+            ['earn', '◈', 'Earn'],
           ].map(([view, icon, label]) => (
             <button className="action" key={view} onClick={() => go(view)}>
               <span className="action-icon" aria-hidden="true">

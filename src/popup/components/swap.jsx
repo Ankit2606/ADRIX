@@ -3,6 +3,24 @@ import { formatUnits } from 'ethers';
 import { call, shorten, trimAmount, formatFiat } from '../../lib/ui.js';
 import { BalanceChanges, GasPresetGrid, Skeleton } from './common.jsx';
 
+/**
+ * Slippage worth accepting for a given route.
+ *
+ * A fixed default is wrong in both directions: 0.5% is far too tight for a thin
+ * pair and needlessly loose for a stablecoin pair. This suggests a floor based
+ * on what the route's own price impact already implies.
+ */
+export function suggestSlippage(quote) {
+  const impact = Math.abs(quote?.priceImpact ?? 0);
+  if (!Number.isFinite(impact) || impact === 0) return null;
+  // Headroom above the impact the quote already shows, since that impact will
+  // move between quoting and inclusion.
+  const suggested = Math.min(MAX_SLIPPAGE_UI, Math.max(0.005, (impact / 100) * 1.5));
+  return Math.round(suggested * 10000) / 10000;
+}
+
+export const MAX_SLIPPAGE_UI = 0.05;
+
 export const NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 
 export const SLIPPAGE_PRESETS = [0.001, 0.005, 0.01, 0.03];
@@ -70,18 +88,36 @@ export function useQuote({ enabled, params, intervalMs = 20_000 }) {
   return { quote, error, loading, fetchedAt, refetch: fetchQuote };
 }
 
-/** Asset picker backed by the aggregator's token list for one chain. */
-export function TokenSelect({ chainId, value, onChange, label, exclude }) {
-  const [tokens, setTokens] = useState([]);
-  const [query, setQuery] = useState('');
-  const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+/**
+ * The aggregator's token list for one chain, cached per chain.
+ *
+ * Shared rather than fetched per selector: the list runs to well over a
+ * thousand entries and both sides of a swap need the same one — including the
+ * parent, which needs the selected token's decimals to convert an amount at all.
+ */
+const tokenListCache = new Map();
+
+export function useTokenList(chainId) {
+  const [tokens, setTokens] = useState(() => tokenListCache.get(chainId) ?? []);
+  const [loading, setLoading] = useState(!tokenListCache.has(chainId));
 
   useEffect(() => {
+    const cached = tokenListCache.get(chainId);
+    if (cached) {
+      setTokens(cached);
+      setLoading(false);
+      return undefined;
+    }
     let cancelled = false;
     setLoading(true);
+    setTokens([]);
     call('SWAP_TOKENS', { chainId })
-      .then((result) => !cancelled && setTokens(result.tokens ?? []))
+      .then((result) => {
+        if (cancelled) return;
+        const list = result.tokens ?? [];
+        tokenListCache.set(chainId, list);
+        setTokens(list);
+      })
       .catch(() => !cancelled && setTokens([]))
       .finally(() => !cancelled && setLoading(false));
     return () => {
@@ -89,8 +125,56 @@ export function TokenSelect({ chainId, value, onChange, label, exclude }) {
     };
   }, [chainId]);
 
-  const selected = tokens.find((token) => token.address?.toLowerCase() === value?.toLowerCase());
+  const find = useCallback(
+    (address) => tokens.find((token) => token.address?.toLowerCase() === String(address ?? '').toLowerCase()) ?? null,
+    [tokens]
+  );
+
+  return { tokens, loading, find };
+}
+
+/**
+ * The pill that opens the picker.
+ *
+ * Kept separate from the picker panel itself. Rendering the open list inside
+ * this button's flex row is what made it overflow the popup — a full-width
+ * panel cannot live inside a row sized for a pill.
+ */
+export function TokenTrigger({ token, label, onOpen, loading }) {
+  return (
+    <button className="token-select" onClick={onOpen} disabled={loading}>
+      {token?.logoURI ? (
+        <img className="token-logo" src={token.logoURI} alt="" referrerPolicy="no-referrer" />
+      ) : (
+        <span className="token-icon sm">{token?.symbol?.charAt(0) ?? '?'}</span>
+      )}
+      <span className="token-select-text">
+        <span className="token-select-symbol">{loading ? '…' : (token?.symbol ?? 'Select')}</span>
+        <span className="token-select-label">{label}</span>
+      </span>
+      <span className="caret" aria-hidden="true">
+        ▼
+      </span>
+    </button>
+  );
+}
+
+/**
+ * Full-width token picker.
+ *
+ * Renders as its own block, never nested in a flex row. Each row carries the
+ * chain it belongs to, its unit price, and — where the aggregator reports one —
+ * its verification status, because a list this long is mostly tokens the user
+ * has never heard of and the symbol alone does not distinguish them.
+ */
+export function TokenPicker({ chainId, chainName, tokens, loading, exclude, balances, onPick, onClose, title }) {
+  const [query, setQuery] = useState('');
   const needle = query.trim().toLowerCase();
+
+  const held = new Map(
+    (balances ?? []).map((entry) => [entry.address?.toLowerCase(), entry])
+  );
+
   const visible = tokens
     .filter((token) => token.address?.toLowerCase() !== exclude?.toLowerCase())
     .filter(
@@ -100,35 +184,26 @@ export function TokenSelect({ chainId, value, onChange, label, exclude }) {
         token.name?.toLowerCase().includes(needle) ||
         token.address?.toLowerCase().includes(needle)
     )
-    .slice(0, 40);
-
-  if (!open) {
-    return (
-      <button className="token-select" onClick={() => setOpen(true)} disabled={loading}>
-        {selected?.logoURI ? (
-          <img className="token-logo" src={selected.logoURI} alt="" referrerPolicy="no-referrer" />
-        ) : (
-          <span className="token-icon sm">{selected?.symbol?.charAt(0) ?? '?'}</span>
-        )}
-        <span className="token-select-text">
-          <span className="token-select-symbol">{loading ? '…' : (selected?.symbol ?? 'Select')}</span>
-          <span className="token-select-label">{label}</span>
-        </span>
-        <span className="caret" aria-hidden="true">
-          ▼
-        </span>
-      </button>
-    );
-  }
+    // Tokens the user actually holds float to the top — with a thousand-plus
+    // entries, alphabetical order buries the handful that matter.
+    .sort((a, b) => {
+      const aHeld = held.has(a.address?.toLowerCase()) ? 1 : 0;
+      const bHeld = held.has(b.address?.toLowerCase()) ? 1 : 0;
+      return bHeld - aHeld;
+    })
+    .slice(0, 60);
 
   return (
-    <div className="card">
+    <div className="card token-picker-panel">
       <div className="between">
-        <span className="eyebrow">{label}</span>
-        <button className="link" onClick={() => setOpen(false)}>
+        <span className="eyebrow">
+          {title} · {chainName}
+        </span>
+        <button className="link" onClick={onClose}>
           close
         </button>
       </div>
+
       <label className="field">
         <span className="visually-hidden">Search tokens</span>
         <input
@@ -137,42 +212,79 @@ export function TokenSelect({ chainId, value, onChange, label, exclude }) {
           placeholder="Symbol, name, or address"
           type="search"
           autoFocus
+          spellCheck="false"
         />
       </label>
-      <div className="list token-picker">
-        {visible.map((token) => (
-          <button
-            className="item compact"
-            key={token.address}
-            onClick={() => {
-              onChange(token.address);
-              setOpen(false);
-              setQuery('');
-            }}
-          >
-            {token.logoURI ? (
-              <img className="token-logo" src={token.logoURI} alt="" loading="lazy" referrerPolicy="no-referrer" />
-            ) : (
-              <span className="token-icon sm">{token.symbol?.charAt(0) ?? '?'}</span>
-            )}
-            <div className="item-main">
-              <span className="item-title">{token.symbol}</span>
-              <span className="item-sub">
-                {token.name} · {shorten(token.address, 6, 4)}
-              </span>
-            </div>
-            {token.priceUSD && <span className="mono small faint">${trimAmount(token.priceUSD, 2)}</span>}
-          </button>
-        ))}
-        {!visible.length && <p className="small faint">No token matches that search.</p>}
-      </div>
+
+      {loading ? (
+        <Skeleton height={54} radius={10} />
+      ) : (
+        <div className="list token-picker">
+          {visible.map((token) => {
+            const balance = held.get(token.address?.toLowerCase());
+            return (
+              <button className="token-row" key={token.address} onClick={() => onPick(token)}>
+                {token.logoURI ? (
+                  <img className="token-logo" src={token.logoURI} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                ) : (
+                  <span className="token-icon sm">{token.symbol?.charAt(0) ?? '?'}</span>
+                )}
+
+                <span className="token-row-main">
+                  <span className="token-row-top">
+                    <span className="token-row-symbol">{token.symbol}</span>
+                    {token.verificationStatus === 'verified' && (
+                      <span className="badge confirmed token-row-badge">verified</span>
+                    )}
+                  </span>
+                  <span className="token-row-sub">{token.name}</span>
+                  <span className="token-row-meta">
+                    {chainName} · {shorten(token.address, 6, 4)}
+                  </span>
+                </span>
+
+                <span className="token-row-right">
+                  {balance && <span className="token-row-balance">{trimAmount(balance.balance, 4)}</span>}
+                  {Number(token.priceUSD) > 0 && (
+                    <span className="token-row-price">{formatFiat(Number(token.priceUSD), 'usd')}</span>
+                  )}
+                </span>
+              </button>
+            );
+          })}
+          {!visible.length && <p className="small faint">No token matches that search.</p>}
+        </div>
+      )}
+
+      <p className="small faint">
+        {tokens.length.toLocaleString()} tokens on {chainName}
+        {visible.length >= 60 ? ' · showing the first 60, keep typing to narrow it' : ''}
+      </p>
     </div>
   );
 }
 
-/** Slippage control, with the consequence of each setting spelled out. */
-export function SlippageControl({ value, onChange }) {
+/**
+ * Slippage control.
+ *
+ * Every setting is stated as what it costs rather than as a number: slippage is
+ * a floor on what you accept, and a loose one is a standing offer to whoever is
+ * watching the mempool. Where the route's own price impact already exceeds the
+ * tolerance, the quote cannot execute — that is worth catching here rather than
+ * as a revert.
+ */
+export function SlippageControl({ value, onChange, quote, symbol }) {
   const [custom, setCustom] = useState('');
+  const suggestion = suggestSlippage(quote);
+  const impact = Math.abs(quote?.priceImpact ?? 0);
+  const tooTight = impact > 0 && value * 100 < impact;
+
+  // What the tolerance is worth in the output token, which is the number people
+  // can actually judge — "0.5%" of an unfamiliar token is not.
+  const atRisk =
+    quote?.toAmountRaw && quote?.toToken?.decimals != null
+      ? Number(fmtUnits(quote.toAmountRaw, quote.toToken.decimals)) * value
+      : null;
 
   return (
     <div className="stack-sm">
@@ -180,6 +292,7 @@ export function SlippageControl({ value, onChange }) {
         <span className="small">Max slippage</span>
         <span className="mono small">{(value * 100).toFixed(2)}%</span>
       </div>
+
       <div className="row3">
         {SLIPPAGE_PRESETS.map((preset) => (
           <button
@@ -203,15 +316,72 @@ export function SlippageControl({ value, onChange }) {
             const next = e.target.value.replace(/[^\d.]/g, '');
             setCustom(next);
             const parsed = Number(next) / 100;
-            if (Number.isFinite(parsed) && parsed > 0 && parsed <= 0.05) onChange(parsed);
+            if (Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_SLIPPAGE_UI) onChange(parsed);
           }}
           aria-label="Custom slippage percent"
         />
       </div>
-      {value > 0.01 && (
+
+      {atRisk != null && (
+        <div className="between small faint">
+          <span>Worst case you accept</span>
+          <span className="mono">
+            up to {trimAmount(atRisk, 6)} {symbol ?? quote?.toToken?.symbol} less
+          </span>
+        </div>
+      )}
+
+      {tooTight && (
+        <div className="notice danger">
+          This route already moves the price {impact.toFixed(2)}%, which is more than the {(value * 100).toFixed(2)}%
+          you are allowing — it will revert.
+          {suggestion && (
+            <button className="link accent" onClick={() => onChange(suggestion)}>
+              Raise to {(suggestion * 100).toFixed(2)}%
+            </button>
+          )}
+        </div>
+      )}
+
+      {!tooTight && value > 0.01 && (
         <div className="notice">
-          {(value * 100).toFixed(2)}% slippage means you accept receiving up to that much less than quoted. High
-          settings are how sandwich bots get paid.
+          {(value * 100).toFixed(2)}% means you accept receiving that much less than quoted. Anyone watching the
+          mempool can take the difference, and at this size it is worth their while.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Price impact, called out separately from the route summary.
+ *
+ * Impact is the cost of the trade itself moving the price — distinct from fees
+ * and from slippage, and the one people conflate. Below a percent it is noise;
+ * past a few percent it usually means the pool is too thin for the size, which
+ * is actionable in a way "high impact" is not.
+ */
+export function PriceImpactWarning({ quote }) {
+  const impact = quote?.priceImpact;
+  if (impact == null || impact > -1) return null;
+
+  const magnitude = Math.abs(impact);
+  const severe = magnitude >= 5;
+
+  return (
+    <div className={severe ? 'notice danger' : 'notice'}>
+      <b>This trade moves the price {magnitude.toFixed(2)}%.</b>
+      <p className="small">
+        {severe
+          ? `You would receive about ${magnitude.toFixed(1)}% less value than you put in, before fees. That is thin liquidity for this size — a smaller amount, or splitting it across several trades, usually costs far less.`
+          : 'Part of the difference between what you pay and what you receive is the trade moving the price against itself, not a fee.'}
+      </p>
+      {quote.fromAmountUsd != null && quote.toAmountUsd != null && (
+        <div className="between small">
+          <span className="faint">Value in / out</span>
+          <span className="mono">
+            {formatFiat(quote.fromAmountUsd, 'usd')} → {formatFiat(quote.toAmountUsd, 'usd')}
+          </span>
         </div>
       )}
     </div>
