@@ -1,10 +1,11 @@
 import { getAddress, isHexString, toUtf8String } from 'ethers';
-import { getChainId, getNetwork, setChain, addNetwork, allNetworks } from './networks.js';
+import { getChainId, getNetwork, setChain, addNetwork, allNetworks, rpcPassthrough, testRpc } from './networks.js';
 import { getWallet, hasVault, isUnlocked, listAccounts } from './keyring.js';
 import * as permissions from './permissions.js';
 import { askUser } from './approvals.js';
 import { sendTransaction, estimateGas, describeTransaction, inspectApproval } from './transactions.js';
 import { addToken } from './tokens.js';
+import * as signatures from './signatures.js';
 import { broadcastEvent, notifyUi } from './events.js';
 import { isDomainFlagged, isAddressFlagged } from './security.js';
 
@@ -176,10 +177,27 @@ export async function handleRpc(method, params = [], origin) {
         raw: rawMessage,
       });
       await permissions.touch(origin, 'personalSign', { account });
-      notifyUi();
 
       const wallet = await getWallet(account);
-      return wallet.signMessage(isHexString(rawMessage) ? hexToBytes(rawMessage) : rawMessage);
+      const signature = await wallet.signMessage(isHexString(rawMessage) ? hexToBytes(rawMessage) : rawMessage);
+
+      // Logged after signing, so the record only ever describes something that
+      // actually happened.
+      await signatures
+        .recordSignature({
+          type: 'personal',
+          origin,
+          account,
+          chainId,
+          networkName: (await getNetwork()).name,
+          message: decodeMessage(rawMessage),
+          raw: typeof rawMessage === 'string' ? rawMessage : '',
+          signature,
+        })
+        .catch(() => {});
+      notifyUi();
+
+      return signature;
     }
 
     case 'eth_sign':
@@ -202,12 +220,30 @@ export async function handleRpc(method, params = [], origin) {
         message: typed.message,
       });
       await permissions.touch(origin, 'typedSign', { account, primaryType: typed.primaryType });
-      notifyUi();
 
       const types = { ...typed.types };
       delete types.EIP712Domain;
       const wallet = await getWallet(account);
-      return wallet.signTypedData(typed.domain, types, typed.message);
+      const signature = await wallet.signTypedData(typed.domain, types, typed.message);
+
+      // A Permit signed here grants spending rights that never appear in the
+      // on-chain approvals list, so this log is the only place it is recorded.
+      await signatures
+        .recordSignature({
+          type: 'typed',
+          origin,
+          account,
+          chainId,
+          networkName: (await getNetwork()).name,
+          primaryType: typed.primaryType,
+          domain: typed.domain,
+          message: typed.message,
+          signature,
+        })
+        .catch(() => {});
+      notifyUi();
+
+      return signature;
     }
 
     // --- transactions -------------------------------------------------------
@@ -279,7 +315,14 @@ export async function handleRpc(method, params = [], origin) {
       }
       if (target === chainId) return null;
 
-      await askUser({ kind: 'switchChain', origin, network: networks[target] });
+      await askUser({
+        kind: 'switchChain',
+        origin,
+        network: networks[target],
+        // Switching is a change of context, and the thing that makes it
+        // meaningful is what it is changing *from*.
+        current: networks[chainId] ?? null,
+      });
       await permissions.grantNetworks(origin, [target]);
       await setChain(target);
       broadcastEvent('chainChanged', target);
@@ -293,7 +336,16 @@ export async function handleRpc(method, params = [], origin) {
       const target = request.chainId?.toLowerCase();
       const networks = await allNetworks();
       if (networks[target]) {
-        await askUser({ kind: 'switchChain', origin, network: networks[target] });
+        await askUser({
+          kind: 'switchChain',
+          origin,
+          network: networks[target],
+          current: networks[chainId] ?? null,
+          // The dApp asked to *add* a network the wallet already has, so this
+          // is really a switch. Saying so avoids a prompt that looks like it is
+          // about to overwrite an existing network's settings.
+          alreadyKnown: true,
+        });
         await permissions.grantNetworks(origin, [target]);
         await setChain(target);
         broadcastEvent('chainChanged', target);
@@ -302,15 +354,34 @@ export async function handleRpc(method, params = [], origin) {
         return null;
       }
 
+      // A dApp usually offers several endpoints. Keeping all of them is the
+      // whole point of the failover list, so they are carried across rather
+      // than discarded down to the first one.
+      const offered = Array.isArray(request.rpcUrls) ? request.rpcUrls : [request.rpcUrls];
       const candidate = {
         chainId: target,
         name: request.chainName,
-        rpc: Array.isArray(request.rpcUrls) ? request.rpcUrls[0] : request.rpcUrls,
+        rpcUrls: offered.filter(Boolean),
+        rpc: offered.filter(Boolean)[0],
         symbol: request.nativeCurrency?.symbol ?? 'ETH',
         explorer: Array.isArray(request.blockExplorerUrls) ? request.blockExplorerUrls[0] : '',
       };
 
-      await askUser({ kind: 'addChain', origin, network: candidate });
+      // Probed before the prompt, not after approval. The one thing that makes
+      // an added network dangerous is an endpoint that serves a different chain
+      // than it claims — the user cannot check that, and the wallet can.
+      const verification = await testRpc(candidate).then(
+        (result) => ({ ok: true, ...result }),
+        (err) => ({ ok: false, error: err.message })
+      );
+
+      await askUser({
+        kind: 'addChain',
+        origin,
+        network: candidate,
+        current: networks[chainId] ?? null,
+        verification,
+      });
       await addNetwork(candidate);
       await permissions.grantNetworks(origin, [target]);
       await setChain(target);
@@ -339,15 +410,9 @@ export async function handleRpc(method, params = [], origin) {
     // --- everything else goes to the node -----------------------------------
     default: {
       await permissions.ensureNetworkPermitted(origin);
-      const network = await getNetwork();
-      const response = await fetch(network.rpc, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
-      });
-      const json = await response.json();
-      if (json.error) fail(json.error.code ?? -32603, json.error.message);
-      return json.result;
+      // Routed through the failover rotation, so a dApp's raw RPC calls survive
+      // an endpoint outage the same way the wallet's own reads do.
+      return rpcPassthrough(chainId, method, params);
     }
   }
 }

@@ -2,6 +2,8 @@ import { Contract, Interface, ZeroAddress, getAddress, formatUnits, parseUnits }
 import { local } from './storage.js';
 import { getProvider, getChainId } from './networks.js';
 import { decodeKnownCall, selectorOf } from './selectors.js';
+import * as tokenLists from './tokenLists.js';
+import * as spam from './spam.js';
 
 export const ERC20_ABI = [
   'function name() view returns (string)',
@@ -89,17 +91,83 @@ const cleanRegistryToken = (token) => ({ ...token, address: token.address.toLowe
 const approvalId = ({ chainId, owner, contract, spender, standard, tokenId = '' }) =>
   [chainId, owner, contract, spender, standard, tokenId].map((part) => String(part ?? '').toLowerCase()).join(':');
 
+/**
+ * Token search across the built-in registry and every enabled imported list.
+ *
+ * Results are annotated rather than filtered: a caller cannot tell a real USDC
+ * from a lookalike by address alone, so each row carries where it came from,
+ * whether ADRIX ships it as canonical, and whether anything else in the user's
+ * lists claims the same symbol. Deciding is the user's job; the job here is to
+ * make the decision possible.
+ */
 export async function searchTokenRegistry(query = '', chainId) {
   const chain = chainId ?? (await getChainId());
   const needle = query.trim().toLowerCase();
-  const tokens = (TOKEN_REGISTRY[chain] ?? []).map(cleanRegistryToken);
-  if (!needle) return tokens;
-  return tokens.filter(
-    (token) =>
-      token.symbol.toLowerCase().includes(needle) ||
-      token.name.toLowerCase().includes(needle) ||
-      token.address.toLowerCase().includes(needle)
-  );
+
+  const builtIn = (TOKEN_REGISTRY[chain] ?? []).map((token) => ({
+    ...cleanRegistryToken(token),
+    sources: ['Built in'],
+    builtIn: true,
+  }));
+
+  const [listed, collisions, tracked] = await Promise.all([
+    tokenLists.listTokensForChain(chain).catch(() => []),
+    tokenLists.findSymbolCollisions(chain).catch(() => new Set()),
+    listTokens(chain, { includeHidden: true }).catch(() => []),
+  ]);
+
+  const merged = new Map();
+  for (const token of builtIn) merged.set(token.address.toLowerCase(), token);
+  for (const token of listed) {
+    const key = token.address.toLowerCase();
+    const existing = merged.get(key);
+    if (existing) {
+      // A contract the wallet already ships stays marked as built-in; the list
+      // agreeing with it is extra corroboration, not a replacement.
+      existing.sources = [...new Set([...existing.sources, ...token.sources])];
+      existing.logoURI ||= token.logoURI;
+      continue;
+    }
+    merged.set(key, { ...token, address: key, builtIn: false });
+  }
+
+  const trackedAddresses = new Set(tracked.map((token) => token.address.toLowerCase()));
+
+  // Filtered before scoring, not after. An imported list runs to thousands of
+  // entries and this is called on every keystroke; scoring the whole set first
+  // would run thousands of regexes per character typed.
+  const candidates = needle
+    ? [...merged.values()].filter(
+        (token) =>
+          token.symbol.toLowerCase().includes(needle) ||
+          token.name.toLowerCase().includes(needle) ||
+          token.address.toLowerCase().includes(needle)
+      )
+    : [...merged.values()];
+
+  const filtered = candidates.slice(0, 200).map((token) => {
+    const score = spam.scoreToken(token, { chainId: chain });
+    return {
+      ...token,
+      tracked: trackedAddresses.has(token.address.toLowerCase()),
+      symbolClash: collisions.has(token.address.toLowerCase()),
+      // Only meaningful for entries that came from a list — a built-in cannot
+      // be impersonating itself.
+      suspicious: !token.builtIn && (score.likelySpam || score.reasons.length > 0),
+      reasons: token.builtIn ? [] : score.reasons,
+    };
+  });
+
+  // Built-ins first, then clean list entries, then anything flagged — so a
+  // lookalike never outranks the real token in a symbol search.
+  return filtered
+    .sort(
+      (a, b) =>
+        Number(b.builtIn) - Number(a.builtIn) ||
+        Number(a.suspicious) - Number(b.suspicious) ||
+        a.symbol.localeCompare(b.symbol)
+    )
+    .slice(0, 100);
 }
 
 export async function listTokens(chainId, { includeHidden = false } = {}) {
@@ -135,11 +203,20 @@ export async function addToken(token, chainId) {
   return metadata;
 }
 
+/**
+ * Balance scan over the built-in registry only.
+ *
+ * Deliberately not the full search set: an imported list runs to thousands of
+ * entries and this makes one balanceOf call per candidate, so scanning a list
+ * would mean thousands of RPC round trips on a button press. The built-in
+ * registry is a couple of dozen majors per chain, which is what "the common
+ * tokens you hold" means here.
+ */
 export async function detectTokens(owner, chainId) {
   const chain = chainId ?? (await getChainId());
   if (!owner) return [];
 
-  const registry = await searchTokenRegistry('', chain);
+  const registry = (TOKEN_REGISTRY[chain] ?? []).map(cleanRegistryToken);
   const current = await listTokens(chain, { includeHidden: true });
   const saved = new Set(current.map((token) => token.address.toLowerCase()));
   const candidates = registry.filter((token) => !saved.has(token.address.toLowerCase()));
@@ -169,11 +246,95 @@ export async function detectTokens(owner, chainId) {
   return detected.sort((a, b) => a.symbol.localeCompare(b.symbol));
 }
 
+/**
+ * Corrects a tracked token's metadata.
+ *
+ * Decimals are the dangerous field. Every amount the user types is scaled by
+ * them (`parseUnits(amount, decimals)`), so a wrong value does not merely
+ * display the balance incorrectly — it sends the wrong quantity. The change is
+ * allowed, because a token with a genuinely misreported `decimals()` is exactly
+ * why this exists, but it is reported back so the UI can require confirmation.
+ */
+export async function editToken(address, patch, chainId) {
+  const chain = chainId ?? (await getChainId());
+  const all = await readAll();
+  const key = String(address ?? '').toLowerCase();
+  const existing = all[chain]?.[key];
+  if (!existing) throw new Error('Token is not tracked.');
+
+  const symbol = String(patch.symbol ?? existing.symbol).trim().slice(0, 24);
+  if (!symbol) throw new Error('Enter a token symbol.');
+  const name = String(patch.name ?? existing.name ?? '').trim().slice(0, 60);
+
+  const decimals = Number(patch.decimals ?? existing.decimals);
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error('Decimals must be a whole number between 0 and 36.');
+  }
+
+  const decimalsChanged = decimals !== Number(existing.decimals);
+  all[chain][key] = { ...existing, symbol, name, decimals, edited: true };
+  await local.set({ tokens: all });
+
+  return { ...all[chain][key], decimalsChanged, previousDecimals: Number(existing.decimals) };
+}
+
+/** Re-reads symbol, name, and decimals from the contract, discarding any edit. */
+export async function refreshTokenMetadata(address, chainId) {
+  const chain = chainId ?? (await getChainId());
+  const all = await readAll();
+  const key = String(address ?? '').toLowerCase();
+  const existing = all[chain]?.[key];
+  if (!existing) throw new Error('Token is not tracked.');
+
+  const onChain = await readTokenMetadata(existing.address, chain);
+  all[chain][key] = { ...existing, ...onChain, edited: false };
+  await local.set({ tokens: all });
+
+  return {
+    ...all[chain][key],
+    changed:
+      onChain.symbol !== existing.symbol ||
+      Number(onChain.decimals) !== Number(existing.decimals) ||
+      onChain.name !== existing.name,
+    previous: { symbol: existing.symbol, decimals: Number(existing.decimals), name: existing.name },
+  };
+}
+
 export async function removeToken(address, chainId) {
   const chain = chainId ?? (await getChainId());
   const all = await readAll();
   if (all[chain]) delete all[chain][address.toLowerCase()];
   await local.set({ tokens: all });
+}
+
+/** Bulk add from a token list selection. Reports per-token outcomes. */
+export async function addTokensFromList(entries = [], chainId) {
+  const chain = chainId ?? (await getChainId());
+  const added = [];
+  const failed = [];
+
+  for (const entry of entries) {
+    try {
+      // Metadata comes from the list, not the chain: a list exists precisely so
+      // thousands of contract reads are not needed. The address was checksummed
+      // at validation time, which is the part that has to be right.
+      await addToken(
+        {
+          address: getAddress(entry.address),
+          symbol: entry.symbol,
+          name: entry.name,
+          decimals: Number(entry.decimals),
+          logoURI: entry.logoURI ?? '',
+        },
+        chain
+      );
+      added.push(entry.symbol);
+    } catch (err) {
+      failed.push({ symbol: entry.symbol ?? entry.address, error: err.shortMessage ?? err.message });
+    }
+  }
+
+  return { added: added.length, symbols: added, failed, total: entries.length };
 }
 
 export async function hideToken(address, chainId) {

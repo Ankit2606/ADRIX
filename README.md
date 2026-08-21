@@ -36,25 +36,44 @@ Content scripts do not inject into `file://` pages, so the demo has to be served
 **Networks**
 - Ethereum, Sepolia, Polygon, Arbitrum, OP Mainnet, Base, BNB Chain, Localhost 8545
 - Add and remove custom networks from the UI or via `wallet_addEthereumChain`
+- Several RPC endpoints per network, tried in order with automatic failover; a
+  failing endpoint is backed off with an increasing cooldown instead of retried
+- Each endpoint is verified independently before it is saved, and the health
+  panel shows which one is currently serving requests
 
 **Tokens**
 - Add ERC-20s by contract address; symbol, decimals, and name are read on chain
 - Per-network token lists with live balances
 - Send tokens; `wallet_watchAsset` prompts the user
 - Track ERC-721/ERC-1155 NFTs by contract and token ID, including metadata images when available
+- NFT detail view with traits, collection floor price, market stats, and explorer links
 - Token and NFT approvals are decoded, shown with warnings, and can be revoked from the wallet UI
 
 **Transactions**
-- Slow / Market / Fast fee presets from live `getFeeData`, EIP-1559 where supported
+- Slow / Market / Fast fee presets built from the priority fees recent blocks
+  actually paid (`eth_feeHistory` percentiles), with inclusion times derived
+  from that data and the chain's measured block time
+- Base fee sparkline over the last 20 blocks, with a wait-or-send hint when the
+  current fee is meaningfully off its own median
 - Gas estimated with 20% headroom; failed simulations surface the revert reason
 - Activity list with pending/confirmed/failed status and explorer links
 - Speed up and cancel by replacing a pending nonce with a 12.5% fee bump
+- Nonce gap detection: names the missing nonce, lists what it is blocking, and
+  offers a priced zero-value fill to unblock the queue
 - Contract method names are decoded for common ERC-20/ERC-721/ERC-1155 calls
 - Transaction notes and tags can be saved and exported with activity CSVs
 - Desktop notification when a transaction settles
 - ENS names resolve in the recipient field
 
 **Security**
+- Address-poisoning defence: a recipient is screened against your accounts, your
+  address book, and everywhere you have confirmed a send, and flagged when it
+  shares the leading and trailing characters a wallet abbreviation shows
+- Recipient badges for first-time addresses, prior send counts, and whether the
+  target is a wallet, a contract, or specifically a token contract
+- Encrypted backup of contacts, account names, networks, tokens, notes, and
+  settings — deliberately no key material; the recovery phrase remains the only
+  key backup
 - Vault encrypted with PBKDF2-SHA256 (600k iterations) + AES-GCM via WebCrypto
 - Keys held in `chrome.storage.session`, which is memory-only and cleared when the browser
   closes; nothing decrypted ever touches disk
@@ -123,21 +142,44 @@ Real wallets carry years of adversarial hardening. This does not have:
 
 - **No security audit.** The crypto uses standard primitives correctly as far as I can tell,
   but nobody has attacked it.
-- **No phishing or scam detection**, no domain blocklist, no approval-spending warnings.
 - **No transaction simulation.** MetaMask shows you the balance changes a transaction will
-  cause. This shows you calldata.
-- **No hardware wallet, no Snaps, no swaps, no bridge, no fiat on-ramp, no NFTs.**
-- **No token price data**, so balances are token counts, not portfolio value.
-- **Public RPC endpoints** are hardcoded and rate-limited. Swap in your own for real use.
-- **Single derivation path.** No Ledger-style legacy paths, no account discovery on import.
-- **No seed-phrase confirmation quiz** during onboarding, so it is easy to skip writing it
-  down, and then the wallet is gone.
+  cause. This shows you decoded calldata and a gas estimate.
+- **No hardware wallet signing, no Snaps, no WalletConnect, no ERC-4337, no EIP-7702.**
+  Hardware, smart, and multisig accounts can be tracked as addresses, but signing for them
+  throws rather than pretending.
+- **Swap, bridge, and buy are unimplemented mock screens.** They show a hardcoded rate and
+  an alert. They are not wired to any provider.
+- **The scam-domain and malicious-address lists are placeholder stubs** — four fake domains
+  and two fake addresses. Address-poisoning screening and approval warnings are real; a
+  phishing blocklist is not.
+- **No indexer**, so the activity list holds only transactions this wallet sent. Incoming
+  transfers never appear, and neither do transactions made from the same account elsewhere.
+- **Public RPC endpoints** are shipped as the defaults and are rate-limited. There are two or
+  three per chain with automatic failover, so one going down is survivable, but they still
+  see every address you query. Swap in your own for real use.
+- **Price and NFT floor data come from CoinGecko's free tier**, which is heavily rate limited
+  and does not know most collections.
+- **No automated tests and no CI.** For a wallet, that is the largest gap on this list.
 
 If you want to take this toward production, the order I would go in: seed-phrase
 confirmation on onboarding, a spending-approval warning on `approve` calls with unlimited
 amounts, transaction simulation, then a real audit before it touches mainnet value.
 
 ## Changelog
+
+**0.2.3** - address-poisoning screening on the send recipient with a full
+address comparison; richer first-time / send-count / token-contract badges;
+encrypted backup and restore for everything the recovery phrase cannot bring
+back; zero-value housekeeping transfers folded out of the history; balance
+refresh made visible, manual, pull-to-refresh, and paused while the popup is
+hidden with backoff on failure.
+
+**0.2.2** - multiple RPC endpoints per network with automatic failover and
+per-endpoint backoff; fee presets and inclusion estimates derived from
+`eth_feeHistory` instead of fixed multipliers and hardcoded times; base fee
+sparkline; nonce gap detection corrected to discount nonces the mempool already
+holds, and surfaced on the home screen with a priced gap-fill; NFT collection
+floor prices on the detail view.
 
 **0.2.1** - correctness pass: normalised stored transaction values to decimal wei, guarded
 the notifications and `setAccessLevel` calls that return `undefined` on some Chrome builds,

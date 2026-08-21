@@ -11,6 +11,11 @@ import * as ens from './ens.js';
 import * as prices from './prices.js';
 import * as i18n from './i18n.js';
 import * as spam from './spam.js';
+import * as tokenLists from './tokenLists.js';
+import * as signatures from './signatures.js';
+import * as backup from './backup.js';
+import * as poisoning from './poisoning.js';
+import { globalSearch } from './search.js';
 import { handleRpc } from './rpc.js';
 import { broadcastEvent, notifyUi } from './events.js';
 
@@ -179,15 +184,32 @@ async function getPortfolio() {
     txs.listActivity(address, chainId),
     ens.profileAddress(address).catch(() => null),
   ]);
-  const [nftList, approvalList, hiddenTokens, hiddenNfts] = await Promise.all([
+  const [nftList, approvalList, hiddenTokens, hiddenNfts, nonce] = await Promise.all([
     tokens.nftBalances(address, chainId).catch(() => []),
     tokens.listApprovals(address, chainId).catch(() => []),
     tokens.listHiddenTokens(chainId).catch(() => []),
     tokens.listHiddenNfts(chainId).catch(() => []),
+    // A blocking nonce gap has to be visible on the home screen, not only in
+    // the send screen's advanced panel — the user has no reason to open that
+    // when the symptom is "my transactions are just sitting there".
+    txs.getNonceInfo(address, chainId).catch(() => null),
   ]);
 
   const nativeBalanceStr = formatEther(balance);
   const priced = await priceChain(chainId, nativeBalanceStr, tokenList, currency);
+
+  // Floors are read from cache only. Fetching them here would put a
+  // third-party round trip per collection inside the 15s home refresh; the NFT
+  // detail screen fetches live, and this shows whatever that has already found.
+  const nftsWithFloors = spam.annotateNfts(nftList).map((nft) => {
+    const collection = prices.peekCollectionFloor(chainId, nft.address);
+    return {
+      ...nft,
+      collection: collection
+        ? { ...collection, floorFiat: prices.fiatValue(collection.floorNative, priced.nativePrice) }
+        : null,
+    };
+  });
 
   return {
     address,
@@ -204,11 +226,14 @@ async function getPortfolio() {
     },
     tokens: spam.annotateTokens(priced.tokens, { chainId }),
     totalFiat: priced.total,
-    nfts: spam.annotateNfts(nftList),
+    nfts: nftsWithFloors,
     hiddenTokens,
     hiddenNfts,
     approvals: approvalList,
-    activity,
+    // Annotated, never filtered here: hiding a row in the background would mean
+    // the UI could not offer to show it.
+    activity: poisoning.annotateActivity(activity),
+    nonce,
     pending: activity.filter((tx) => tx.status === 'pending').length,
   };
 }
@@ -442,6 +467,9 @@ const handlers = {
   TEST_RPC: ({ network }) => networks.testRpc(network),
   CHECK_NETWORK_HEALTH: async ({ chainId, force = true }) => networks.getNetworkHealth(chainId, { force }),
   CHECK_ALL_NETWORKS: () => networks.checkAllNetworks(),
+  // --- RPC endpoints (failover) --------------------------------------------
+  PEEK_ENDPOINTS: async ({ chainId }) => ({ endpoints: await networks.peekEndpoints(chainId) }),
+  CHECK_ENDPOINTS: async ({ chainId }) => ({ endpoints: await networks.checkEndpoints(chainId) }),
   REMOVE_NETWORK: async ({ chainId }) => {
     await networks.removeNetwork(chainId);
     await permissions.purgeNetwork(chainId);
@@ -460,7 +488,53 @@ const handlers = {
   SEARCH_TOKENS: ({ query }) => tokens.searchTokenRegistry(query),
   DETECT_TOKENS: async () => tokens.detectTokens(await keyring.getSelected()),
   ADD_TOKEN: ({ token }) => tokens.addToken(token),
-  REMOVE_TOKEN: ({ address }) => tokens.removeToken(address),
+  ADD_TOKENS: async ({ entries }) => {
+    const result = await tokens.addTokensFromList(entries);
+    notifyUi();
+    return result;
+  },
+  EDIT_TOKEN: async ({ address, patch }) => {
+    const result = await tokens.editToken(address, patch);
+    notifyUi();
+    return result;
+  },
+  REFRESH_TOKEN_METADATA: async ({ address }) => {
+    const result = await tokens.refreshTokenMetadata(address);
+    notifyUi();
+    return result;
+  },
+  REMOVE_TOKEN: async ({ address }) => {
+    await tokens.removeToken(address);
+    notifyUi();
+    return { ok: true };
+  },
+
+  // --- token lists ---------------------------------------------------------
+  GET_TOKEN_LISTS: async () => ({
+    lists: await tokenLists.listTokenLists(),
+    curated: tokenLists.CURATED_LISTS,
+  }),
+  PREVIEW_TOKEN_LIST: ({ url }) => tokenLists.fetchTokenList(url),
+  ADD_TOKEN_LIST: async ({ url }) => {
+    const result = await tokenLists.saveTokenList(url);
+    notifyUi();
+    return result;
+  },
+  REFRESH_TOKEN_LIST: async ({ url }) => {
+    const result = await tokenLists.refreshTokenList(url);
+    notifyUi();
+    return result;
+  },
+  SET_TOKEN_LIST_ENABLED: async ({ url, enabled }) => {
+    const result = await tokenLists.setTokenListEnabled(url, enabled);
+    notifyUi();
+    return result;
+  },
+  REMOVE_TOKEN_LIST: async ({ url }) => {
+    const result = await tokenLists.removeTokenList(url);
+    notifyUi();
+    return result;
+  },
   HIDE_TOKEN: ({ address }) => tokens.hideToken(address),
   HIDE_TOKENS: async ({ addresses }) => {
     for (const address of addresses ?? []) await tokens.hideToken(address).catch(() => {});
@@ -479,6 +553,26 @@ const handlers = {
   },
   UNHIDE_NFT: ({ nft }) => tokens.unhideNft(nft),
   LOOKUP_ENS_PROFILE: ({ address }) => ens.profileAddress(address),
+  /** Live collection floor for one NFT contract, priced in the user's currency. */
+  GET_NFT_COLLECTION: async ({ address, chainId, force = false }) => {
+    const chain = chainId ?? (await networks.getChainId());
+    const currency = await prices.getCurrency();
+    const collection = await prices.collectionFloor(chain, address, { force });
+    if (!collection) return { collection: null, currency };
+
+    // The floor is quoted in the chain's native coin, so converting it uses the
+    // same native price the rest of the portfolio is valued with — no second
+    // rate, and no drift between the two numbers on screen.
+    const nativePrice = await prices.nativePrice(chain, currency);
+    return {
+      currency,
+      collection: {
+        ...collection,
+        floorFiat: prices.fiatValue(collection.floorNative, nativePrice),
+        volume24hFiat: prices.fiatValue(collection.volume24hNative, nativePrice),
+      },
+    };
+  },
   // The Send screen needs calldata before it can estimate gas. It asks here
   // rather than re-implementing the encoding, so the estimate and the real
   // transaction can never drift apart.
@@ -486,10 +580,16 @@ const handlers = {
 
   // --- sending -------------------------------------------------------------
   RESOLVE_RECIPIENT: ({ input }) => txs.resolveRecipient(input).then((address) => ({ address })),
-  INSPECT_RECIPIENT: ({ input }) => txs.inspectRecipient(input),
+  INSPECT_RECIPIENT: ({ input, tokenAddress }) => txs.inspectRecipient(input, null, { tokenAddress }),
   PARSE_PAYMENT_URI: ({ input }) => ({ parsed: txs.parsePaymentUri(input) }),
   GET_TRANSACTION_DETAIL: ({ hash }) => txs.getTransactionDetail(hash),
   GET_NONCE_INFO: async ({ address }) => txs.getNonceInfo(address ?? (await keyring.getSelected())),
+  GET_FEE_HISTORY: ({ chainId }) => txs.getFeeHistory(chainId),
+  QUOTE_NONCE_FILL: async ({ nonce }) => txs.quoteNonceGapFill({ nonce, from: await keyring.getSelected() }),
+  FILL_NONCE_GAP: async ({ nonce, fees, gas }) => {
+    const hash = await txs.fillNonceGap({ nonce, fees, gas, from: await keyring.getSelected() });
+    return { hash };
+  },
   VALIDATE_FEES: ({ fees, gasInfo }) => txs.validateFees(fees, gasInfo),
   LIST_PENDING: async () => txs.listPending(await keyring.getSelected()),
   ESTIMATE_GAS: ({ request }) => txs.estimateGas(request),
@@ -609,6 +709,43 @@ const handlers = {
     }
     return { ok: true };
   },
+
+  // --- encrypted backup ----------------------------------------------------
+  GET_BACKUP_SECTIONS: () => ({ sections: backup.BACKUP_SECTIONS }),
+  EXPORT_BACKUP: ({ password, sections }) => backup.exportBackup(password, sections),
+  PREVIEW_BACKUP: ({ password, file }) => backup.previewBackup(password, file),
+  RESTORE_BACKUP: async ({ password, file, sections }) => {
+    const result = await backup.restoreBackup(password, file, sections);
+    // A restore can rename accounts, add networks, and change the theme, so
+    // every open surface needs to re-read rather than keep a stale snapshot.
+    notifyUi();
+    return result;
+  },
+
+  // --- signature log -------------------------------------------------------
+  // Destructured field by field rather than passed straight through: the router
+  // hands the whole message to the handler, and it carries a `type` of its own
+  // that would otherwise be read as the signature-type filter and match nothing.
+  LIST_SIGNATURES: async ({ origin, account, signatureType, kind, query } = {}) => ({
+    signatures: await signatures.listSignatures({ origin, account, type: signatureType, kind, query }),
+    stats: await signatures.signatureStats(account),
+  }),
+  SIGNATURE_STATS: async ({ account }) => signatures.signatureStats(account ?? (await keyring.getSelected())),
+  CLEAR_SIGNATURES: async () => {
+    const result = await signatures.clearSignatures();
+    notifyUi();
+    return result;
+  },
+
+  // --- search --------------------------------------------------------------
+  GLOBAL_SEARCH: async ({ query }) => globalSearch(query, { address: await keyring.getSelected() }),
+  ACTIVITY_BY_CHAIN: async ({ address }) => ({
+    chains: await txs.activityChainSummary(address ?? (await keyring.getSelected())),
+  }),
+  LIST_ALL_ACTIVITY: async ({ address }) =>
+    poisoning.annotateActivity(
+      await txs.listActivity(address ?? (await keyring.getSelected()), null, { allChains: true })
+    ),
 
   // --- contacts ------------------------------------------------------------
   LIST_CONTACTS: () => contacts.listContacts(),

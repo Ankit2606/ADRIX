@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { formatEther, formatUnits } from 'ethers';
 import { call, shorten, trimAmount, accountColor } from '../lib/ui.js';
+import { BaseFeePanel, GasPresetGrid } from '../popup/components/common.jsx';
 import Unlock from '../popup/views/Unlock.jsx';
 
 const initialId = Number(new URLSearchParams(window.location.search).get('id'));
@@ -399,13 +400,24 @@ function TransactionRequest({ request, preset, setPreset }) {
         <div className="between">
           <span className="small">Network fee</span>
           <span className="mono small">
-            ~{trimAmount(fee?.estimatedFee, 6)} {gas?.symbol}
+            {/* The likely cost at the current base fee, not the max-fee ceiling.
+                Quoting the ceiling makes every transaction look 2-3x pricier
+                than it will actually be. */}
+            ~{trimAmount(fee?.likelyFee ?? fee?.estimatedFee, 6)} {gas?.symbol}
           </span>
         </div>
+        {fee?.likelyFee && fee.estimatedFee !== fee.likelyFee && (
+          <div className="between">
+            <span className="small faint">Most it could cost</span>
+            <span className="mono small faint">
+              {trimAmount(fee.estimatedFee, 6)} {gas?.symbol}
+            </span>
+          </div>
+        )}
         <div className="between">
           <span className="small">Total</span>
           <span className="mono small">
-            ~{trimAmount(Number(value) + Number(fee?.estimatedFee ?? 0), 6)} {request.symbol}
+            ~{trimAmount(Number(value) + Number(fee?.likelyFee ?? fee?.estimatedFee ?? 0), 6)} {request.symbol}
           </span>
         </div>
         {request.summary?.selector && (
@@ -467,14 +479,8 @@ function TransactionRequest({ request, preset, setPreset }) {
       {gas && (
         <>
           <h3>Fee speed</h3>
-          <div className="gas-grid">
-            {['low', 'market', 'fast'].map((key) => (
-              <button key={key} className="gas-option" aria-pressed={preset === key} onClick={() => setPreset(key)}>
-                <b>{key === 'low' ? 'Slow' : key === 'market' ? 'Market' : 'Fast'}</b>
-                <span>~{trimAmount(gas.options[key].estimatedFee, 6)}</span>
-              </button>
-            ))}
-          </div>
+          <GasPresetGrid gasInfo={gas} preset={preset} onSelect={setPreset} />
+          <BaseFeePanel feeHistory={gas.feeHistory} compact />
         </>
       )}
 
@@ -619,34 +625,136 @@ function formatArgValue(value) {
   return text.length > 66 ? `${text.slice(0, 30)}…${text.slice(-16)}` : text;
 }
 
+/**
+ * The dApp-initiated network prompt.
+ *
+ * Two things make this dangerous and neither is visible from the raw request:
+ * an endpoint that serves a chain other than the one it claims, and a silent
+ * move between a testnet and a mainnet. So the RPC is probed before this
+ * renders, and the change is shown as from → to rather than as a single name
+ * the user has to recognise on its own.
+ */
 function ChainRequest({ request }) {
   const isAdd = request.kind === 'addChain';
+  const target = request.network;
+  const current = request.current;
+  const verification = request.verification;
+  const urls = target.rpcUrls?.length ? target.rpcUrls : [target.rpc].filter(Boolean);
+
+  // Crossing the testnet boundary changes whether the money is real.
+  const crossingRealMoney = current && current.testnet && target.testnet === false;
+  const crossingToTest = current && !current.testnet && target.testnet;
+
   return (
     <>
       <h1>{isAdd ? 'Add this network' : 'Switch network'}</h1>
+
+      {request.alreadyKnown && (
+        <div className="notice info">
+          This site asked to add a network ADRIX already has, so nothing will be added — this is a switch.
+        </div>
+      )}
+
+      <div className="card">
+        <div className="chain-hop">
+          <div className="chain-hop-side">
+            <span className="chain-hop-label">From</span>
+            <span className="chain-hop-name">{current?.name ?? 'Not connected'}</span>
+            <span className="chain-hop-meta mono">{current?.chainId ?? '--'}</span>
+          </div>
+          <span className="chain-hop-arrow" aria-hidden="true">
+            →
+          </span>
+          <div className="chain-hop-side">
+            <span className="chain-hop-label">To</span>
+            <span className="chain-hop-name">{target.name}</span>
+            <span className="chain-hop-meta mono">{target.chainId}</span>
+          </div>
+        </div>
+      </div>
+
+      {crossingRealMoney && (
+        <div className="notice danger">
+          This moves you from a test network to <b>{target.name}</b>, where transactions spend real funds.
+        </div>
+      )}
+      {crossingToTest && (
+        <div className="notice">
+          This moves you to a test network. Balances there have no value, and anything you send will not appear on{' '}
+          {current.name}.
+        </div>
+      )}
+
       <div className="card">
         <div className="between">
-          <span className="small">Name</span>
-          <span>{request.network.name}</span>
-        </div>
-        <div className="between">
-          <span className="small">Chain ID</span>
-          <span className="mono small">{request.network.chainId}</span>
-        </div>
-        <div className="between">
           <span className="small">Currency</span>
-          <span className="mono small">{request.network.symbol}</span>
+          <span className="mono small">{target.symbol}</span>
         </div>
-        <div className="eyebrow">RPC endpoint</div>
-        <div className="data-block">{request.network.rpc}</div>
+        {target.explorer && (
+          <div className="between">
+            <span className="small">Explorer</span>
+            <span className="mono small break">{target.explorer}</span>
+          </div>
+        )}
+        <div className="eyebrow">RPC endpoint{urls.length > 1 ? `s (${urls.length})` : ''}</div>
+        {urls.map((url) => (
+          <div className="data-block" key={url}>
+            {url}
+          </div>
+        ))}
       </div>
+
+      {isAdd && verification && <ChainVerification verification={verification} target={target} />}
+
       {isAdd && (
         <div className="notice">
-          This endpoint will see your address and the transactions you broadcast. Add networks only from sites you
-          trust.
+          This endpoint will see every address you query and every transaction you broadcast on this network. Add
+          networks only from sites you trust.
         </div>
       )}
     </>
+  );
+}
+
+/** What the pre-flight probe of the offered endpoint found. */
+function ChainVerification({ verification, target }) {
+  if (!verification.ok) {
+    return (
+      <div className="notice danger">
+        <b>ADRIX could not verify this endpoint.</b>
+        <p className="small">{verification.error}</p>
+        <p className="small">
+          An endpoint that cannot be reached, or that serves a different chain than {target.chainId}, can produce
+          signatures valid somewhere you did not intend. Adding it anyway is not recommended.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card">
+      <div className="between">
+        <span className="eyebrow">Endpoint check</span>
+        <span className="badge confirmed">chain ID matches</span>
+      </div>
+      <div className="kv">
+        <span className="kv-key">Round trip</span>
+        <span className="kv-value">{verification.latencyMs}ms</span>
+      </div>
+      <div className="kv">
+        <span className="kv-key">Head block</span>
+        <span className="kv-value">{verification.blockNumber}</span>
+      </div>
+      <div className="kv">
+        <span className="kv-key">Fee market</span>
+        <span className="kv-value">{verification.supportsEip1559 ? 'EIP-1559' : 'legacy gas price'}</span>
+      </div>
+      {verification.warnings?.map((warning) => (
+        <div className="notice" key={warning}>
+          {warning}
+        </div>
+      ))}
+    </div>
   );
 }
 

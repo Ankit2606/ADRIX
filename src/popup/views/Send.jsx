@@ -5,11 +5,23 @@ import {
   shorten,
   trimAmount,
   formatFiat,
+  formatEta,
   currencySymbol,
+  estimateInclusion,
+  timeAgo,
   useDebounced,
   useAsyncAction,
 } from '../../lib/ui.js';
-import { BackBar, Avatar, QrScanner, EmptyState, Skeleton } from '../components/common.jsx';
+import {
+  BackBar,
+  Avatar,
+  QrScanner,
+  EmptyState,
+  Skeleton,
+  BaseFeePanel,
+  GasPresetGrid,
+  NonceGapWarning,
+} from '../components/common.jsx';
 
 export default function Send({ state, go }) {
   const [portfolio, setPortfolio] = useState(null);
@@ -75,14 +87,16 @@ export default function Send({ state, go }) {
       return undefined;
     }
     setInspecting(true);
-    call('INSPECT_RECIPIENT', { input: debouncedRecipient })
+    // The asset is passed along so the check can catch the specific case of
+    // sending a token to its own contract, which is unrecoverable.
+    call('INSPECT_RECIPIENT', { input: debouncedRecipient, tokenAddress: asset === 'native' ? null : asset })
       .then((result) => !cancelled && setInspection(result))
       .catch(() => !cancelled && setInspection(null))
       .finally(() => !cancelled && setInspecting(false));
     return () => {
       cancelled = true;
     };
-  }, [debouncedRecipient]);
+  }, [debouncedRecipient, asset]);
 
   /**
    * Accepts a raw address, an ENS name, or an EIP-681 payment link. Links carry
@@ -595,6 +609,10 @@ export default function Send({ state, go }) {
           {!token && <p className="small">Max sends the balance minus the estimated network fee.</p>}
           {overBalance && <div className="error">That is more than the available balance.</div>}
 
+          {/* A blocking gap makes this send unmineable too, so it is shown
+              whether or not the advanced panel is open. */}
+          <NonceGapWarning info={nonceInfo} />
+
           <label className="check-line">
             <input type="checkbox" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)} />
             Advanced controls (gas and nonce)
@@ -672,14 +690,7 @@ export default function Send({ state, go }) {
             )}
           </div>
 
-          {inspection?.isContract && (
-            <div className="notice">
-              The recipient is a contract, not a regular wallet. Sending tokens to a token contract usually loses them.
-            </div>
-          )}
-          {inspection?.seenBefore === false && (
-            <div className="notice">First time sending to this address. Check it once more.</div>
-          )}
+          <RecipientWarnings inspection={inspection} token={token} symbol={symbol} />
 
           <FeeControls
             gasInfo={gasInfo}
@@ -753,15 +764,119 @@ function RecipientStatus({ inspection, inspecting, busy }) {
     );
   }
 
+  const kind = inspection.contractKind;
+
   return (
-    <div className="inline wrap" id="recipient-status" aria-live="polite">
-      <span className="badge confirmed">valid</span>
-      {inspection.ens && <span className="badge accent">{inspection.ens}</span>}
-      {inspection.isContract === true && <span className="badge failed">contract</span>}
-      {inspection.isContract === false && <span className="badge">wallet</span>}
-      {inspection.seenBefore === false && <span className="badge pending">first time</span>}
-      {inspection.seenBefore === true && <span className="badge">sent before</span>}
+    <div className="stack-sm" id="recipient-status" aria-live="polite">
+      <div className="inline wrap">
+        <span className="badge confirmed">valid</span>
+        {inspection.ens && <span className="badge accent">{inspection.ens}</span>}
+        {inspection.isOwnAccount && <span className="badge accent">your account</span>}
+        {inspection.contact && <span className="badge accent">☆ {inspection.contact.name}</span>}
+
+        {/* What is at the address, at the resolution that matters: "contract" is
+            a shrug, "USDC token contract" is a reason not to send. */}
+        {kind?.kind === 'token' && (
+          <span className="badge failed">{kind.symbol ? `${kind.symbol} token contract` : 'token contract'}</span>
+        )}
+        {kind?.kind === 'nft' && <span className="badge failed">{kind.standard} contract</span>}
+        {kind?.kind === 'contract' && <span className="badge pending">contract</span>}
+        {inspection.isContract === false && <span className="badge">wallet</span>}
+
+        {inspection.seenBefore === false && !inspection.contact && !inspection.isOwnAccount && (
+          <span className="badge pending">first time</span>
+        )}
+        {inspection.sendCount > 0 && (
+          <span className="badge">
+            sent {inspection.sendCount}×{inspection.lastSentAt ? ` · ${timeAgo(inspection.lastSentAt)}` : ''}
+          </span>
+        )}
+      </div>
+
+      {/* The loud one. A lookalike is not a caveat to note alongside the others —
+          it is the whole reason to stop. */}
+      {inspection.lookalike && (
+        <div className={inspection.lookalike.severity === 'danger' ? 'notice danger' : 'notice'}>
+          <b>{inspection.lookalike.title}</b>
+          <p className="small">{inspection.lookalike.body}</p>
+          <div className="addr-compare">
+            <span className="addr-compare-label">You are sending to</span>
+            <span className="mono small break">{inspection.address}</span>
+            <span className="addr-compare-label">Which resembles</span>
+            <span className="mono small break">{inspection.lookalike.against.address}</span>
+          </div>
+        </div>
+      )}
+
+      {inspection.attemptedOnly && (
+        <p className="small faint">
+          You have tried sending here before, but none of those transactions confirmed.
+        </p>
+      )}
     </div>
+  );
+}
+
+/**
+ * The warnings worth repeating on the review screen.
+ *
+ * Everything here is a way to lose the funds outright rather than merely a
+ * surprise, so it is shown again at the last point where cancelling is free.
+ */
+function RecipientWarnings({ inspection, token, symbol }) {
+  if (!inspection) return null;
+  const kind = inspection.contractKind;
+  const warnings = [];
+
+  if (inspection.isSendingToOwnToken) {
+    warnings.push({
+      tone: 'danger',
+      body: `This sends ${symbol} to the ${symbol} contract itself. Token contracts have no logic to return what is sent to them, so this is not recoverable. This is almost always a copied address gone wrong.`,
+    });
+  } else if (token && kind?.kind === 'token') {
+    warnings.push({
+      tone: 'danger',
+      body: `The recipient is ${kind.symbol ? `the ${kind.symbol} token contract` : 'a token contract'}, not a wallet. Tokens sent to another token's contract are stuck there permanently.`,
+    });
+  } else if (token && kind?.kind === 'nft') {
+    warnings.push({
+      tone: 'danger',
+      body: `The recipient is an ${kind.standard} contract. It has no way to forward or return ERC-20 tokens sent to it.`,
+    });
+  } else if (kind?.kind === 'contract') {
+    warnings.push({
+      tone: 'warn',
+      body: 'The recipient is a contract. It will only accept this if it implements a payable receive function — otherwise the transaction reverts and you still pay the fee.',
+    });
+  }
+
+  if (inspection.lookalike) {
+    warnings.push({
+      tone: inspection.lookalike.severity === 'danger' ? 'danger' : 'warn',
+      body: `${inspection.lookalike.title} ${inspection.lookalike.body}`,
+    });
+  }
+
+  if (inspection.seenBefore === false && !inspection.contact && !inspection.isOwnAccount) {
+    warnings.push({
+      tone: 'plain',
+      body: 'First time sending to this address. Compare the whole thing against your source, not just the first and last few characters.',
+    });
+  }
+
+  if (!warnings.length) return null;
+
+  return (
+    <>
+      {warnings.map((warning, index) => (
+        <div
+          key={index}
+          className={warning.tone === 'danger' ? 'notice danger' : warning.tone === 'warn' ? 'notice' : 'notice info'}
+        >
+          {warning.body}
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -789,6 +904,16 @@ function FeeControls({
 }) {
   const baseFeeGwei = gasInfo.baseFeePerGas ? formatUnits(gasInfo.baseFeePerGas, 'gwei') : null;
 
+  // Re-times a hand-entered priority fee against the same percentiles the
+  // presets are built from, so leaving the presets does not mean losing the
+  // only signal about how long this will take.
+  const customEta = useMemo(() => {
+    if (!advanced || !gasInfo.feeHistory?.supported) return null;
+    const fees = safeCustomFees(gasInfo, customGasPrice, customMaxFee, customPriorityFee);
+    if (!fees?.maxPriorityFeePerGas) return null;
+    return estimateInclusion(fees.maxPriorityFeePerGas, gasInfo.feeHistory);
+  }, [advanced, gasInfo, customGasPrice, customMaxFee, customPriorityFee]);
+
   return (
     <div className="stack-sm">
       <div className="between">
@@ -801,31 +926,32 @@ function FeeControls({
 
       {baseFeeGwei && (
         <div className="between small faint">
-          <span>Current base fee</span>
+          <span>Base fee for the next block</span>
           <span className="mono">{trimAmount(baseFeeGwei, 3)} gwei</span>
         </div>
       )}
 
-      <div className="gas-grid">
-        {['low', 'market', 'fast'].map((key) => {
-          const option = gasInfo.options[key];
-          return (
-            <button
-              key={key}
-              className="gas-option"
-              aria-pressed={!advanced && preset === key}
-              onClick={() => {
-                setAdvanced(false);
-                setPreset(key);
-              }}
-            >
-              <b>{key === 'low' ? 'Slow' : key === 'market' ? 'Market' : 'Fast'}</b>
-              <span>~{trimAmount(option.likelyFee ?? option.estimatedFee, 6)}</span>
-              {option.etaSeconds && <span className="eta">~{formatEta(option.etaSeconds)}</span>}
-            </button>
-          );
-        })}
+      <div className={advanced ? 'dimmed' : ''}>
+        <GasPresetGrid
+          gasInfo={gasInfo}
+          preset={advanced ? null : preset}
+          onSelect={(key) => {
+            setAdvanced(false);
+            setPreset(key);
+          }}
+        />
       </div>
+
+      <BaseFeePanel feeHistory={gasInfo.feeHistory} />
+
+      {advanced && customEta && (
+        <div className="between small">
+          <span className="faint">At this priority fee</span>
+          <span className="mono">
+            ~{formatEta(customEta.seconds)} · {customEta.blocks} block{customEta.blocks === 1 ? '' : 's'}
+          </span>
+        </div>
+      )}
 
       {advanced && (
         <div className="card">
@@ -967,11 +1093,6 @@ function NoncePanel({ nonce, setNonce, info, status }) {
       )}
     </div>
   );
-}
-
-function formatEta(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.round(seconds / 60)} min`;
 }
 
 /**

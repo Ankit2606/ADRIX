@@ -1,10 +1,14 @@
 import { Contract, formatEther, formatUnits, getAddress, isAddress, parseEther } from 'ethers';
 import { local } from './storage.js';
 import { getProvider, getNetwork, getChainId } from './networks.js';
-import { getWallet } from './keyring.js';
+import { getWallet, listAccounts } from './keyring.js';
+import * as contacts from './contacts.js';
+import * as poisoning from './poisoning.js';
 import {
   ERC20_ABI,
   ERC721_ABI,
+  ERC165_ABI,
+  listTokens,
   decodeContractCall,
   encodeApprovalRevoke,
   getApproval,
@@ -13,17 +17,235 @@ import {
 } from './tokens.js';
 
 // ---------------------------------------------------------------------------
+// Fee history
+//
+// eth_feeHistory gives the last N blocks of base fees, how full each block was,
+// and the priority fees actually paid at chosen percentiles. That is enough to
+// stop guessing at two things the old code hardcoded: what a preset should bid,
+// and how long that bid will take to land.
+// ---------------------------------------------------------------------------
+const FEE_HISTORY_BLOCKS = 20;
+const REWARD_PERCENTILES = [10, 50, 90];
+const FEE_HISTORY_TTL_MS = 12_000;
+const BLOCK_TIME_TTL_MS = 5 * 60_000;
+
+const feeHistoryCache = new Map(); // chainId -> { at, data }
+const blockTimeCache = new Map(); // chainId -> { at, seconds }
+
+// Per-chain fallbacks, used only when the block times cannot be measured.
+const FALLBACK_BLOCK_TIME = {
+  '0x1': 12,
+  '0xaa36a7': 12,
+  '0x89': 2.1,
+  '0xa4b1': 0.26,
+  '0xa': 2,
+  '0x2105': 2,
+  '0x38': 3,
+};
+
+const minBig = (a, b) => (a < b ? a : b);
+const maxBig = (a, b) => (a > b ? a : b);
+
+function medianBig(values) {
+  if (!values.length) return 0n;
+  const sorted = [...values].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+/**
+ * Average seconds per block, measured rather than assumed. Chains differ by two
+ * orders of magnitude here, so a shared constant would make every time estimate
+ * wrong somewhere.
+ */
+async function getBlockTimeSeconds(chainId, provider, headNumber, oldestNumber) {
+  const cached = blockTimeCache.get(chainId);
+  if (cached && Date.now() - cached.at < BLOCK_TIME_TTL_MS) return cached.seconds;
+
+  const span = headNumber - oldestNumber;
+  if (span > 0) {
+    const [head, oldest] = await Promise.all([
+      provider.getBlock(headNumber).catch(() => null),
+      provider.getBlock(oldestNumber).catch(() => null),
+    ]);
+    if (head?.timestamp && oldest?.timestamp && head.timestamp > oldest.timestamp) {
+      const seconds = (head.timestamp - oldest.timestamp) / span;
+      blockTimeCache.set(chainId, { at: Date.now(), seconds });
+      return seconds;
+    }
+  }
+
+  return FALLBACK_BLOCK_TIME[chainId] ?? 12;
+}
+
+/**
+ * Recent base fees, congestion, and the priority fees people are actually
+ * paying. Returns null when the endpoint does not serve eth_feeHistory — every
+ * caller degrades to the older multiplier-based behaviour rather than failing.
+ */
+export async function getFeeHistory(chainId) {
+  const chain = chainId ?? (await getChainId());
+  const cached = feeHistoryCache.get(chain);
+  if (cached && Date.now() - cached.at < FEE_HISTORY_TTL_MS) return cached.data;
+
+  try {
+    const provider = await getProvider(chain);
+    const raw = await provider.send('eth_feeHistory', [
+      `0x${FEE_HISTORY_BLOCKS.toString(16)}`,
+      'latest',
+      REWARD_PERCENTILES,
+    ]);
+    if (!raw?.baseFeePerGas?.length) throw new Error('empty fee history');
+
+    const series = raw.baseFeePerGas.map((value) => BigInt(value));
+    // eth_feeHistory returns N+1 base fees: the final entry is the *next*
+    // block's, already determined by how full the head block was. That one is
+    // what a transaction sent now will actually be charged against.
+    const nextBaseFee = series[series.length - 1];
+    const history = series.slice(0, -1);
+    const ratios = (raw.gasUsedRatio ?? []).map(Number);
+    const oldestBlock = Number(BigInt(raw.oldestBlock ?? '0x0'));
+    const headNumber = oldestBlock + history.length - 1;
+
+    // Median across blocks rather than mean: one empty block reporting a zero
+    // priority fee should not drag the whole percentile down.
+    const rewardRows = (raw.reward ?? []).map((row) => row.map((value) => BigInt(value)));
+    const column = (index) => medianBig(rewardRows.map((row) => row[index] ?? 0n).filter((value) => value > 0n));
+
+    const median = medianBig(history);
+    const congestion = ratios.length
+      ? ratios.slice(-5).reduce((sum, value) => sum + value, 0) / Math.min(5, ratios.length)
+      : 0.5;
+
+    const first = history[0] ?? nextBaseFee;
+    const percent = first > 0n ? Number(((nextBaseFee - first) * 10000n) / first) / 100 : 0;
+    const direction = percent > 5 ? 'rising' : percent < -5 ? 'falling' : 'flat';
+
+    const blockTimeSeconds = await getBlockTimeSeconds(chain, provider, headNumber, oldestBlock);
+
+    const data = {
+      supported: true,
+      // Oldest → newest, ready for the sparkline. Strings, because this crosses
+      // a chrome.runtime message boundary and BigInt does not survive that.
+      baseFees: history.map((value) => value.toString()),
+      blocks: history.map((value, index) => ({
+        number: oldestBlock + index,
+        baseFee: value.toString(),
+        ratio: ratios[index] ?? null,
+      })),
+      nextBaseFee: nextBaseFee.toString(),
+      median: median.toString(),
+      min: history.reduce((low, value) => minBig(low, value), history[0] ?? 0n).toString(),
+      max: history.reduce((high, value) => maxBig(high, value), history[0] ?? 0n).toString(),
+      trend: { direction, percent: Math.round(percent * 10) / 10 },
+      congestion: Math.round(congestion * 100) / 100,
+      blockTimeSeconds: Math.round(blockTimeSeconds * 100) / 100,
+      rewards: {
+        low: column(0).toString(),
+        market: column(1).toString(),
+        fast: column(2).toString(),
+      },
+      advice: feeAdvice(nextBaseFee, median, direction, percent),
+      fetchedAt: Date.now(),
+    };
+
+    feeHistoryCache.set(chain, { at: Date.now(), data });
+    return data;
+  } catch {
+    const data = { supported: false, fetchedAt: Date.now() };
+    // Cached as a miss too, so an endpoint without feeHistory is not re-asked
+    // on every keystroke in the fee editor.
+    feeHistoryCache.set(chain, { at: Date.now(), data });
+    return data;
+  }
+}
+
+/**
+ * Whether it is worth waiting. Only speaks up when the current base fee is
+ * meaningfully off its own recent median *and* moving in the helpful direction
+ * — a hint that fires constantly is a hint nobody reads.
+ */
+function feeAdvice(nextBaseFee, median, direction, percent) {
+  if (median <= 0n) return null;
+  const ratio = Number((nextBaseFee * 100n) / median) / 100;
+
+  if (direction === 'falling' && ratio > 1.1) {
+    return {
+      action: 'wait',
+      message: `The base fee is ${Math.round((ratio - 1) * 100)}% above its 20-block median and falling. Waiting a few blocks will probably cost less.`,
+    };
+  }
+  if (direction === 'rising' && ratio < 0.95) {
+    return {
+      action: 'send',
+      message: `The base fee is below its 20-block median but climbing ${Math.abs(percent)}%. Sending now is likely cheaper than waiting.`,
+    };
+  }
+  if (direction === 'rising' && ratio > 1.25) {
+    return {
+      action: 'wait',
+      message: `The base fee is ${Math.round((ratio - 1) * 100)}% above its recent median and still rising. Unless this is time-sensitive, it is a poor moment to send.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * How many blocks a given priority fee should wait, from where it sits among
+ * the fees recently paid. This is an estimate from observed data, not a
+ * prediction service, and the UI says so.
+ */
+function estimateInclusion(priorityWei, history) {
+  const rewards = history?.rewards;
+  const blockTime = history?.blockTimeSeconds ?? 12;
+
+  let blocks;
+  if (!rewards || BigInt(rewards.fast) === 0n) {
+    blocks = 3;
+  } else if (priorityWei >= BigInt(rewards.fast)) {
+    blocks = 1;
+  } else if (priorityWei >= BigInt(rewards.market)) {
+    blocks = 2;
+  } else if (priorityWei >= BigInt(rewards.low)) {
+    blocks = 5;
+  } else {
+    blocks = 12;
+  }
+
+  // Consistently full blocks mean a backlog, so the same bid queues longer.
+  const congestion = history?.congestion ?? 0.5;
+  if (congestion > 0.9) blocks *= 2;
+  else if (congestion < 0.4) blocks = Math.max(1, Math.round(blocks * 0.6));
+
+  return { blocks, seconds: Math.max(1, Math.round(blocks * blockTime)) };
+}
+
+// ---------------------------------------------------------------------------
 // Gas
 // ---------------------------------------------------------------------------
-const PRESET_MULTIPLIERS = { low: 0.85, market: 1, fast: 1.4 };
 
-// Rough inclusion times. These are honest approximations, not a prediction
-// service — they exist so "Slow" means something concrete to the user.
+// Used only when eth_feeHistory is unavailable.
+const PRESET_MULTIPLIERS = { low: 0.85, market: 1, fast: 1.4 };
 const PRESET_ETA = { low: 180, market: 45, fast: 15 };
 
+/**
+ * Preset shape when fee history *is* available.
+ *
+ * The priority fee is what actually orders transactions within a block, so it
+ * comes straight from the percentile of what recent blocks paid. The max fee is
+ * only a ceiling — paying it is not the normal case — so each preset carries
+ * enough headroom above the next base fee to survive a rise without the user
+ * overpaying for it.
+ */
+const PRESET_SHAPE = {
+  low: { percentile: 'low', headroomPercent: 130n },
+  market: { percentile: 'market', headroomPercent: 200n },
+  fast: { percentile: 'fast', headroomPercent: 300n },
+};
+
 export async function estimateGas({ from, to, value = '0x0', data = '0x', chainId }) {
-  const provider = await getProvider(chainId);
-  const network = await getNetwork(chainId);
+  const chain = chainId ?? (await getChainId());
+  const provider = await getProvider(chain);
+  const network = await getNetwork(chain);
 
   const request = { from, to: to || undefined, value: value || '0x0', data: data || '0x' };
 
@@ -41,13 +263,15 @@ export async function estimateGas({ from, to, value = '0x0', data = '0x', chainI
     estimateError = err.shortMessage ?? err.message;
   }
 
-  const feeData = await provider.getFeeData();
+  const [feeData, feeHistory] = await Promise.all([provider.getFeeData(), getFeeHistory(chain)]);
   const supportsEip1559 = feeData.maxFeePerGas != null;
+  const history = feeHistory?.supported ? feeHistory : null;
 
   // The base fee is what actually gets burned and what a max fee has to clear.
-  // getFeeData does not expose it directly, so it is read from the head block.
-  let baseFeePerGas = null;
-  if (supportsEip1559) {
+  // Fee history already carries the next block's, which is the one a
+  // transaction sent now is charged against; otherwise read the head block.
+  let baseFeePerGas = history?.nextBaseFee ?? null;
+  if (supportsEip1559 && baseFeePerGas == null) {
     const head = await provider.getBlock('latest').catch(() => null);
     if (head?.baseFeePerGas != null) baseFeePerGas = head.baseFeePerGas.toString();
   }
@@ -55,10 +279,22 @@ export async function estimateGas({ from, to, value = '0x0', data = '0x', chainI
   const options = {};
   for (const [name, multiplier] of Object.entries(PRESET_MULTIPLIERS)) {
     const scale = (wei) => (wei * BigInt(Math.round(multiplier * 100))) / 100n;
+
     if (supportsEip1559) {
-      const priority = scale(feeData.maxPriorityFeePerGas ?? 1_000_000_000n);
-      const max = scale(feeData.maxFeePerGas);
-      const maxFee = max > priority ? max : priority + 1n;
+      const shape = PRESET_SHAPE[name];
+      const observed = history ? BigInt(history.rewards[shape.percentile]) : 0n;
+
+      // A chain can legitimately have a zero-tip block, but bidding zero means
+      // nothing ever includes you, so fall back to the node's suggestion.
+      const priority = observed > 0n ? observed : scale(feeData.maxPriorityFeePerGas ?? 1_000_000_000n);
+
+      const base = baseFeePerGas != null ? BigInt(baseFeePerGas) : 0n;
+      const ceiling =
+        history && base > 0n ? (base * shape.headroomPercent) / 100n + priority : scale(feeData.maxFeePerGas);
+      const maxFee = ceiling > priority ? ceiling : priority + 1n;
+
+      const eta = estimateInclusion(priority, history);
+
       options[name] = {
         type: 2,
         maxPriorityFeePerGas: priority.toString(),
@@ -66,10 +302,11 @@ export async function estimateGas({ from, to, value = '0x0', data = '0x', chainI
         estimatedFee: formatEther(gasLimit * maxFee),
         // What the transaction most likely costs at the current base fee, as
         // opposed to the worst case the max fee allows.
-        likelyFee: baseFeePerGas
-          ? formatEther(gasLimit * minBig(maxFee, BigInt(baseFeePerGas) + priority))
-          : null,
-        etaSeconds: PRESET_ETA[name],
+        likelyFee: baseFeePerGas ? formatEther(gasLimit * minBig(maxFee, base + priority)) : null,
+        etaSeconds: history ? eta.seconds : PRESET_ETA[name],
+        etaBlocks: history ? eta.blocks : null,
+        // Whether the number above came from measurement or from a constant.
+        etaSource: history ? 'feeHistory' : 'estimate',
       };
     } else {
       const gasPrice = scale(feeData.gasPrice ?? 1_000_000_000n);
@@ -79,6 +316,8 @@ export async function estimateGas({ from, to, value = '0x0', data = '0x', chainI
         estimatedFee: formatEther(gasLimit * gasPrice),
         likelyFee: formatEther(gasLimit * gasPrice),
         etaSeconds: PRESET_ETA[name],
+        etaBlocks: null,
+        etaSource: 'estimate',
       };
     }
   }
@@ -91,11 +330,10 @@ export async function estimateGas({ from, to, value = '0x0', data = '0x', chainI
     baseFeePerGas,
     suggestedPriorityFee: feeData.maxPriorityFeePerGas?.toString() ?? null,
     gasPrice: feeData.gasPrice?.toString() ?? null,
+    feeHistory,
     estimateError,
   };
 }
-
-const minBig = (a, b) => (a < b ? a : b);
 
 /**
  * Checks a hand-entered fee against live network conditions. Returns problems
@@ -140,33 +378,90 @@ export function validateFees(fees, gasInfo) {
   return { problems, warnings, ok: problems.length === 0 };
 }
 
+/** The fee a stored transaction was actually sent with, in wei, or null. */
+function feeCeilingOf(tx) {
+  const raw = tx.maxFeePerGas ?? tx.gasPrice;
+  if (raw == null) return null;
+  try {
+    return BigInt(raw);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Nonce state for an account: what the chain has confirmed, what the mempool
  * expects next, and whether a gap is blocking everything behind it.
+ *
+ * Nonces execute strictly in order, so one missing number freezes every
+ * transaction after it — indefinitely, and silently. It is the single most
+ * confusing state a wallet can be in, which is why this reports not just that a
+ * gap exists but exactly what it is holding up.
  */
 export async function getNonceInfo(address, chainId) {
   const chain = chainId ?? (await getChainId());
   const provider = await getProvider(chain);
 
-  const [confirmed, pendingCount] = await Promise.all([
+  const [confirmed, pendingCount, feeHistory] = await Promise.all([
     provider.getTransactionCount(address, 'latest'),
     provider.getTransactionCount(address, 'pending'),
+    getFeeHistory(chain).catch(() => null),
   ]);
 
   const local = await listPending(address, chain);
   const localNonces = local.map((tx) => tx.nonce).filter((n) => Number.isInteger(n));
 
-  // A gap means some nonce between the confirmed head and our lowest pending
-  // one was never broadcast, so nothing after it can ever be mined.
+  // `pending - latest` is the run of consecutive nonces the mempool already
+  // holds starting at the confirmed head, so [confirmed, pendingCount) is
+  // accounted for even when those transactions came from another device.
+  //
+  // A real gap is a nonce at or above that point which nothing fills: the
+  // mempool does not have it and neither do we, so it will never be mined, and
+  // nothing behind it can be either. Measuring from `confirmed` instead — as
+  // this used to — reported every in-flight transaction from another device as
+  // a gap, which was a false alarm on the most alarming warning in the wallet.
   const gaps = [];
   if (localNonces.length) {
-    const lowest = Math.min(...localNonces);
-    for (let n = confirmed; n < lowest; n++) gaps.push(n);
     const sorted = [...new Set(localNonces)].sort((a, b) => a - b);
+    for (let n = pendingCount; n < sorted[0]; n++) gaps.push(n);
     for (let i = 1; i < sorted.length; i++) {
-      for (let n = sorted[i - 1] + 1; n < sorted[i]; n++) gaps.push(n);
+      for (let n = sorted[i - 1] + 1; n < sorted[i]; n++) {
+        if (n >= pendingCount) gaps.push(n);
+      }
     }
   }
+
+  const uniqueGaps = [...new Set(gaps)].sort((a, b) => a - b);
+  const firstGap = uniqueGaps[0] ?? null;
+
+  const describe = (tx) => ({
+    hash: tx.hash,
+    nonce: tx.nonce,
+    submittedAt: tx.submittedAt,
+    label: tx.tokenSymbol ? `${tx.tokenAmount} ${tx.tokenSymbol}` : (tx.decoded?.label ?? 'Transfer'),
+    maxFeePerGas: tx.maxFeePerGas ?? null,
+    gasPrice: tx.gasPrice ?? null,
+  });
+
+  // Everything stuck behind the gap. Naming them turns "something is wrong"
+  // into "these three transactions are waiting on nonce 42".
+  const blocked = firstGap == null ? [] : local.filter((tx) => tx.nonce > firstGap).map(describe);
+
+  // Separately: a transaction whose max fee no longer clears the base fee
+  // cannot be included at any point, gap or not. That is a speed-up, not a gap
+  // fill, so it is reported as its own condition.
+  const base = feeHistory?.supported ? BigInt(feeHistory.nextBaseFee) : null;
+  const underpriced =
+    base == null
+      ? []
+      : local
+          .filter((tx) => {
+            const ceiling = feeCeilingOf(tx);
+            return ceiling != null && ceiling < base;
+          })
+          .map(describe);
+
+  const oldestPendingAt = local.length ? Math.min(...local.map((tx) => tx.submittedAt ?? Date.now())) : null;
 
   return {
     confirmed,
@@ -174,8 +469,77 @@ export async function getNonceInfo(address, chainId) {
     pendingCount: Math.max(0, pendingCount - confirmed),
     // Nonces of our own pending transactions, so the UI can say "this replaces X".
     pendingNonces: [...new Set(localNonces)].sort((a, b) => a - b),
-    gaps: [...new Set(gaps)].sort((a, b) => a - b),
+    gaps: uniqueGaps,
+    firstGap,
+    blocked,
+    underpriced,
+    oldestPendingAt,
+    stuckForMs: oldestPendingAt ? Date.now() - oldestPendingAt : null,
+    baseFeePerGas: base?.toString() ?? null,
   };
+}
+
+/**
+ * Prices filling a nonce gap without sending it.
+ *
+ * The fix is a zero-value self-transfer at the missing nonce: the cheapest
+ * possible transaction that can occupy that slot and let the queue behind it
+ * drain. It still costs 21,000 gas of real money, so the user sees the price
+ * first.
+ */
+export async function quoteNonceGapFill({ nonce, from, chainId }) {
+  const chain = chainId ?? (await getChainId());
+  const info = await getNonceInfo(from, chain);
+  const target = nonce ?? info.firstGap;
+
+  if (target == null) throw new Error('There is no nonce gap to fill on this account.');
+  if (!info.gaps.includes(target)) {
+    throw new Error(`Nonce ${target} is no longer missing — the queue may have already cleared.`);
+  }
+
+  const gasInfo = await estimateGas({ from, to: from, value: '0x0', data: '0x', chainId: chain });
+
+  return {
+    nonce: target,
+    from,
+    chainId: chain,
+    gasInfo,
+    blocked: info.blocked,
+    effect: `Sends an empty transaction to your own address at nonce ${target}, which unblocks the ${info.blocked.length} transaction${info.blocked.length === 1 ? '' : 's'} queued behind it.`,
+  };
+}
+
+export async function fillNonceGap({ nonce, from, fees, gas, chainId }) {
+  const chain = chainId ?? (await getChainId());
+  const info = await getNonceInfo(from, chain);
+  const target = nonce ?? info.firstGap;
+
+  if (target == null) throw new Error('There is no nonce gap to fill on this account.');
+  // Re-checked at send time: the gap may have closed while the user was reading
+  // the quote, and sending into a nonce that is no longer free just wastes gas.
+  if (!info.gaps.includes(target)) {
+    throw new Error(`Nonce ${target} is no longer missing — nothing was sent.`);
+  }
+
+  const resolved =
+    fees && gas
+      ? { fees, gas }
+      : await estimateGas({ from, to: from, value: '0x0', data: '0x', chainId: chain }).then((quote) => ({
+          fees: quote.options.market,
+          gas: quote.gasLimit,
+        }));
+
+  return sendTransaction({
+    from,
+    to: from,
+    value: '0x0',
+    data: '0x',
+    gas: resolved.gas,
+    fees: resolved.fees,
+    nonce: target,
+    chainId: chain,
+    meta: { kind: 'nonceFill', filledNonce: target },
+  });
 }
 
 /**
@@ -219,7 +583,46 @@ export async function resolveRecipient(input) {
  * Also reports whether the target is a contract, which is worth knowing before
  * sending tokens to what might be a token contract itself.
  */
-export async function inspectRecipient(input, chainId) {
+/**
+ * Every address the user demonstrably knows: their own accounts, their address
+ * book, and anywhere they have successfully sent before. This is the reference
+ * set a pasted recipient is screened against.
+ */
+async function knownAddresses(chainId) {
+  const [accounts, contactList, activity] = await Promise.all([
+    listAccounts().catch(() => []),
+    contacts.listContacts().catch(() => []),
+    readActivity().catch(() => []),
+  ]);
+
+  const known = new Map();
+  const add = (address, label, weight) => {
+    if (!address) return;
+    const key = address.toLowerCase();
+    const existing = known.get(key);
+    // A contact label beats "an address you have sent to" when both apply.
+    if (!existing || weight > existing.weight) known.set(key, { address, label, weight });
+  };
+
+  for (const account of accounts) add(account.address, `your account "${account.name}"`, 3);
+  for (const contact of contactList) add(contact.address, `your contact "${contact.name}"`, 2);
+  for (const tx of activity) {
+    // Only confirmed sends count as an address the user has really used — a
+    // failed transaction to a poisoned address should not legitimise it.
+    if (tx.status === 'confirmed' && tx.to) add(tx.to, 'an address you have sent to', 1);
+  }
+
+  return [...known.values()];
+}
+
+/**
+ * Inspects a recipient without throwing, for live feedback as the user types.
+ *
+ * Answers three separate questions the Send screen needs, none of which is
+ * visible from the address itself: have I used this before, is it a contract
+ * (and specifically a token contract), and is it imitating something of mine.
+ */
+export async function inspectRecipient(input, chainId, { tokenAddress } = {}) {
   const value = String(input ?? '').trim();
   if (!value) return { state: 'empty' };
 
@@ -230,26 +633,110 @@ export async function inspectRecipient(input, chainId) {
     return { state: 'invalid', message: err.message };
   }
 
+  const chain = chainId ?? (await getChainId());
   const isEns = !value.startsWith('0x');
   const result = { state: 'ok', address, ens: isEns ? value : null };
+  const lower = address.toLowerCase();
 
+  // --- history: how well does the user know this address? -------------------
   try {
-    const provider = await getProvider(chainId);
+    const [activity, contact, accounts] = await Promise.all([
+      readActivity(),
+      contacts.findContactByAddress(address).catch(() => null),
+      listAccounts().catch(() => []),
+    ]);
+
+    const sends = activity.filter((tx) => tx.to?.toLowerCase() === lower);
+    const confirmed = sends.filter((tx) => tx.status === 'confirmed');
+
+    result.sendCount = confirmed.length;
+    result.lastSentAt = confirmed.length ? Math.max(...confirmed.map((tx) => tx.submittedAt ?? 0)) : null;
+    // Attempted-but-never-confirmed is its own signal: it usually means the
+    // address is wrong in some way.
+    result.attemptedOnly = confirmed.length === 0 && sends.length > 0;
+    result.seenBefore = confirmed.length > 0;
+    result.contact = contact ? { name: contact.name, label: contact.label ?? '' } : null;
+    result.isOwnAccount = accounts.some((account) => account.address.toLowerCase() === lower);
+  } catch {
+    result.seenBefore = null;
+    result.sendCount = null;
+  }
+
+  // --- lookalike screening ---------------------------------------------------
+  try {
+    // Self-evidently not an impostor if it is already a known address.
+    if (!result.seenBefore && !result.contact && !result.isOwnAccount) {
+      const known = await knownAddresses(chain);
+      const match = poisoning.screenRecipient(address, known);
+      result.lookalike = match ? { ...match, ...poisoning.describeLookalike(match) } : null;
+    } else {
+      result.lookalike = null;
+    }
+  } catch {
+    result.lookalike = null;
+  }
+
+  // --- what is at this address? ---------------------------------------------
+  try {
+    const provider = await getProvider(chain);
     const code = await provider.getCode(address);
     result.isContract = code && code !== '0x';
+
+    if (result.isContract) {
+      result.contractKind = await identifyContract(address, chain, provider);
+      // The specific catastrophe this guards against: sending a token to its
+      // own contract, or to another token's contract. Both are unrecoverable
+      // in practice — the contract has no logic to give it back.
+      result.isSendingToOwnToken = Boolean(tokenAddress) && tokenAddress.toLowerCase() === lower;
+    }
   } catch {
     result.isContract = null;
   }
 
-  // "Have I sent here before" — cheap first-time-recipient signal from local history.
+  return result;
+}
+
+/**
+ * What kind of contract sits at an address.
+ *
+ * Only enough to answer "is this somewhere tokens go to die". A tracked token
+ * is checked first because that is a local lookup and covers the common case;
+ * the on-chain probes are the fallback for contracts the wallet has not seen.
+ */
+async function identifyContract(address, chainId, provider) {
+  const lower = address.toLowerCase();
+
   try {
-    const all = await readActivity();
-    result.seenBefore = all.some((tx) => tx.to?.toLowerCase() === address.toLowerCase());
+    const tracked = await listTokens(chainId, { includeHidden: true });
+    const match = tracked.find((token) => token.address.toLowerCase() === lower);
+    if (match) return { kind: 'token', standard: 'ERC20', symbol: match.symbol, tracked: true };
   } catch {
-    result.seenBefore = null;
+    /* fall through to the on-chain probes */
   }
 
-  return result;
+  try {
+    const probe = new Contract(address, ERC165_ABI, provider);
+    const [is721, is1155] = await Promise.all([
+      probe.supportsInterface('0x80ac58cd').catch(() => null),
+      probe.supportsInterface('0xd9b67a26').catch(() => null),
+    ]);
+    if (is721 === true) return { kind: 'nft', standard: 'ERC721' };
+    if (is1155 === true) return { kind: 'nft', standard: 'ERC1155' };
+  } catch {
+    /* not EIP-165 aware */
+  }
+
+  try {
+    // An address answering both decimals() and symbol() is an ERC-20 for every
+    // practical purpose, whether or not it declares an interface.
+    const erc20 = new Contract(address, ERC20_ABI, provider);
+    const [decimals, symbol] = await Promise.all([erc20.decimals(), erc20.symbol().catch(() => '')]);
+    if (decimals != null) return { kind: 'token', standard: 'ERC20', symbol, tracked: false };
+  } catch {
+    /* not a token */
+  }
+
+  return { kind: 'contract', standard: null };
 }
 
 /**
@@ -310,12 +797,55 @@ export function parsePaymentUri(input) {
 // ---------------------------------------------------------------------------
 const readActivity = () => local.get('activity', []);
 
-export async function listActivity(address, chainId) {
+/**
+ * One account's activity on one chain.
+ *
+ * Scoped to a single chain by default and always has been — the same nonce
+ * sequence, token symbol, and even the same contract address mean different
+ * things on different networks, so a blended list is actively misleading. What
+ * was missing was any way to *see* that scoping, which activityChainSummary
+ * below provides.
+ */
+export async function listActivity(address, chainId, { allChains = false } = {}) {
   const chain = chainId ?? (await getChainId());
   const all = await readActivity();
   return all
-    .filter((tx) => tx.chainId === chain && tx.from.toLowerCase() === address?.toLowerCase())
+    .filter(
+      (tx) => (allChains || tx.chainId === chain) && tx.from?.toLowerCase() === address?.toLowerCase()
+    )
     .sort((a, b) => b.submittedAt - a.submittedAt);
+}
+
+/**
+ * Per-chain counts for one account, so the activity screen can say "42 more on
+ * other networks" instead of leaving the user to guess whether a transaction
+ * they remember is missing or merely elsewhere.
+ */
+export async function activityChainSummary(address) {
+  const all = await readActivity();
+  const mine = all.filter((tx) => tx.from?.toLowerCase() === address?.toLowerCase());
+
+  const byChain = new Map();
+  for (const tx of mine) {
+    const row = byChain.get(tx.chainId) ?? {
+      chainId: tx.chainId,
+      networkName: tx.networkName ?? tx.chainId,
+      symbol: tx.symbol ?? '',
+      total: 0,
+      pending: 0,
+      failed: 0,
+      lastAt: 0,
+    };
+    row.total += 1;
+    if (tx.status === 'pending') row.pending += 1;
+    if (tx.status === 'failed') row.failed += 1;
+    row.lastAt = Math.max(row.lastAt, tx.submittedAt ?? 0);
+    // A later row may carry a network name an earlier one lacked.
+    if (!row.networkName || row.networkName === tx.chainId) row.networkName = tx.networkName ?? row.networkName;
+    byChain.set(tx.chainId, row);
+  }
+
+  return [...byChain.values()].sort((a, b) => b.lastAt - a.lastAt);
 }
 
 async function recordActivity(entry) {
@@ -530,6 +1060,13 @@ export async function sendTransaction({ from, to, value = '0x0', data = '0x', ga
     data: request.data,
     decoded,
     nonce: sent.nonce,
+    // Stored so a pending transaction can later be checked against the live
+    // base fee without a chain read per row. A max fee that no longer clears
+    // the base fee is the difference between "waiting" and "will never land".
+    gasLimit: request.gasLimit?.toString() ?? null,
+    maxFeePerGas: request.maxFeePerGas?.toString() ?? null,
+    maxPriorityFeePerGas: request.maxPriorityFeePerGas?.toString() ?? null,
+    gasPrice: request.gasPrice?.toString() ?? null,
     status: 'pending',
     submittedAt: Date.now(),
     symbol: network.symbol,

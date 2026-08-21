@@ -14,6 +14,7 @@ import Swap from './views/Swap.jsx';
 import Bridge from './views/Bridge.jsx';
 import Buy from './views/Buy.jsx';
 import BatchSend from './views/BatchSend.jsx';
+import Search from './views/Search.jsx';
 
 const VIEWS = {
   send: Send,
@@ -26,11 +27,17 @@ const VIEWS = {
   networks: Networks,
   addToken: AddToken,
   settings: Settings,
+  search: Search,
 };
 
 export default function App() {
   const { state, error, loading, refresh } = useBackgroundState();
-  const [view, setView] = useState('home');
+  // A view plus its arguments. Search results have to be able to say "open the
+  // home screen *at this transaction*", which a bare view name cannot express.
+  const [route, setRoute] = useState({ name: 'home', params: null });
+
+  const go = (name, params = null) =>
+    setRoute(typeof name === 'string' ? { name, params } : { name: 'home', params: null });
 
   // Locale has to be applied before any child renders a translated string.
   useTranslation(state?.locale);
@@ -43,7 +50,7 @@ export default function App() {
 
   // Coming back to a locked wallet should never leave a stale inner screen up.
   useEffect(() => {
-    if (state && (!state.hasVault || !state.unlocked)) setView('home');
+    if (state && (!state.hasVault || !state.unlocked)) setRoute({ name: 'home', params: null });
   }, [state?.hasVault, state?.unlocked]);
 
   if (error) {
@@ -70,6 +77,6 @@ export default function App() {
   if (!state.hasVault) return <Onboarding onDone={refresh} />;
   if (!state.unlocked) return <Unlock onDone={refresh} />;
 
-  const View = VIEWS[view] ?? Home;
-  return <View state={state} refresh={refresh} go={setView} />;
+  const View = VIEWS[route.name] ?? Home;
+  return <View state={state} refresh={refresh} go={go} params={route.params} />;
 }

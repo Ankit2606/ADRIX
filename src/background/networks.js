@@ -1,11 +1,26 @@
 import { JsonRpcProvider, Network } from 'ethers';
 import { local } from './storage.js';
 
+// ---------------------------------------------------------------------------
+// Chain registry
+//
+// Every network carries an ordered *list* of RPC endpoints rather than a single
+// URL. The first one that answers wins; the rest are failover. A public
+// endpoint rate-limiting or going down is the most common way a wallet appears
+// broken, and it is entirely survivable when there is somewhere else to ask.
+// ---------------------------------------------------------------------------
+
+export const MAX_RPC_URLS = 6;
+
 export const BUILTIN_NETWORKS = {
   '0x1': {
     chainId: '0x1',
     name: 'Ethereum',
-    rpc: 'https://ethereum-rpc.publicnode.com',
+    rpcUrls: [
+      'https://ethereum-rpc.publicnode.com',
+      'https://eth.llamarpc.com',
+      'https://cloudflare-eth.com',
+    ],
     symbol: 'ETH',
     decimals: 18,
     explorer: 'https://etherscan.io',
@@ -14,7 +29,11 @@ export const BUILTIN_NETWORKS = {
   '0xaa36a7': {
     chainId: '0xaa36a7',
     name: 'Sepolia',
-    rpc: 'https://ethereum-sepolia-rpc.publicnode.com',
+    rpcUrls: [
+      'https://ethereum-sepolia-rpc.publicnode.com',
+      'https://sepolia.drpc.org',
+      'https://rpc.sepolia.org',
+    ],
     symbol: 'ETH',
     decimals: 18,
     explorer: 'https://sepolia.etherscan.io',
@@ -23,7 +42,11 @@ export const BUILTIN_NETWORKS = {
   '0x89': {
     chainId: '0x89',
     name: 'Polygon',
-    rpc: 'https://polygon-bor-rpc.publicnode.com',
+    rpcUrls: [
+      'https://polygon-bor-rpc.publicnode.com',
+      'https://polygon-rpc.com',
+      'https://polygon.drpc.org',
+    ],
     symbol: 'POL',
     decimals: 18,
     explorer: 'https://polygonscan.com',
@@ -32,7 +55,11 @@ export const BUILTIN_NETWORKS = {
   '0xa4b1': {
     chainId: '0xa4b1',
     name: 'Arbitrum One',
-    rpc: 'https://arbitrum-one-rpc.publicnode.com',
+    rpcUrls: [
+      'https://arbitrum-one-rpc.publicnode.com',
+      'https://arb1.arbitrum.io/rpc',
+      'https://arbitrum.drpc.org',
+    ],
     symbol: 'ETH',
     decimals: 18,
     explorer: 'https://arbiscan.io',
@@ -41,7 +68,11 @@ export const BUILTIN_NETWORKS = {
   '0xa': {
     chainId: '0xa',
     name: 'OP Mainnet',
-    rpc: 'https://optimism-rpc.publicnode.com',
+    rpcUrls: [
+      'https://optimism-rpc.publicnode.com',
+      'https://mainnet.optimism.io',
+      'https://optimism.drpc.org',
+    ],
     symbol: 'ETH',
     decimals: 18,
     explorer: 'https://optimistic.etherscan.io',
@@ -50,7 +81,11 @@ export const BUILTIN_NETWORKS = {
   '0x2105': {
     chainId: '0x2105',
     name: 'Base',
-    rpc: 'https://base-rpc.publicnode.com',
+    rpcUrls: [
+      'https://base-rpc.publicnode.com',
+      'https://mainnet.base.org',
+      'https://base.drpc.org',
+    ],
     symbol: 'ETH',
     decimals: 18,
     explorer: 'https://basescan.org',
@@ -59,7 +94,11 @@ export const BUILTIN_NETWORKS = {
   '0x38': {
     chainId: '0x38',
     name: 'BNB Chain',
-    rpc: 'https://bsc-rpc.publicnode.com',
+    rpcUrls: [
+      'https://bsc-rpc.publicnode.com',
+      'https://bsc-dataseed.bnbchain.org',
+      'https://bsc.drpc.org',
+    ],
     symbol: 'BNB',
     decimals: 18,
     explorer: 'https://bscscan.com',
@@ -68,7 +107,7 @@ export const BUILTIN_NETWORKS = {
   '0x7a69': {
     chainId: '0x7a69',
     name: 'Localhost 8545',
-    rpc: 'http://127.0.0.1:8545',
+    rpcUrls: ['http://127.0.0.1:8545'],
     symbol: 'ETH',
     decimals: 18,
     explorer: '',
@@ -77,6 +116,237 @@ export const BUILTIN_NETWORKS = {
 };
 
 export const DEFAULT_CHAIN = '0xaa36a7';
+
+// ---------------------------------------------------------------------------
+// Endpoint health and rotation
+//
+// State lives in memory only. It is cheap to rebuild, the cooldowns are short,
+// and writing it to disk on every failed request would churn storage for no
+// benefit — the service worker restarting is not a reason to keep punishing an
+// endpoint that may well have recovered.
+// ---------------------------------------------------------------------------
+const endpointState = new Map(); // url -> { failures, cooldownUntil, latencyMs, lastOkAt, lastError }
+
+const COOLDOWN_BASE_MS = 15_000;
+const MAX_COOLDOWN_MS = 5 * 60_000;
+const RPC_TIMEOUT_MS = 12_000;
+
+function stateFor(url) {
+  let state = endpointState.get(url);
+  if (!state) {
+    state = { failures: 0, cooldownUntil: 0, latencyMs: null, lastOkAt: null, lastError: null };
+    endpointState.set(url, state);
+  }
+  return state;
+}
+
+function markOk(url, latencyMs) {
+  const state = stateFor(url);
+  state.failures = 0;
+  state.cooldownUntil = 0;
+  state.latencyMs = latencyMs;
+  state.lastOkAt = Date.now();
+  state.lastError = null;
+}
+
+function markFailure(url, error) {
+  const state = stateFor(url);
+  state.failures += 1;
+  // Back off further each time rather than hammering a dead host on every read.
+  state.cooldownUntil = Date.now() + Math.min(MAX_COOLDOWN_MS, COOLDOWN_BASE_MS * 2 ** (state.failures - 1));
+  state.lastError = error?.message ?? String(error);
+}
+
+/**
+ * Endpoints in the order they should be tried: healthy ones first in the user's
+ * own order, then cooled-down ones by soonest expiry. Every endpoint is always
+ * returned — during a total outage a last-resort attempt beats refusing to try.
+ */
+function orderedEndpoints(urls) {
+  const now = Date.now();
+  const ready = [];
+  const resting = [];
+  for (const url of urls) {
+    if (stateFor(url).cooldownUntil > now) resting.push(url);
+    else ready.push(url);
+  }
+  resting.sort((a, b) => stateFor(a).cooldownUntil - stateFor(b).cooldownUntil);
+  return [...ready, ...resting];
+}
+
+/** One POST to one endpoint. Throws on transport failure; a JSON-RPC error body is a success. */
+async function postRpc(url, payload, timeoutMs = RPC_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} from ${hostOf(url)}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Tries each endpoint until one answers.
+ *
+ * A JSON-RPC *error* — a revert, a bad parameter, an unsupported method — is a
+ * real answer and is returned as-is. Rotating on those would turn one node's
+ * honest "this call reverts" into a scan across every endpoint, and would hide
+ * the revert reason behind whichever node failed last.
+ */
+async function sendWithFailover(urls, payload) {
+  const candidates = orderedEndpoints(urls);
+  let lastError = null;
+
+  for (const url of candidates) {
+    const started = Date.now();
+    try {
+      const json = await postRpc(url, payload);
+      markOk(url, Date.now() - started);
+      return json;
+    } catch (err) {
+      markFailure(url, err);
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    candidates.length > 1
+      ? `All ${candidates.length} RPC endpoints failed. Last error: ${lastError?.message ?? 'unknown'}`
+      : (lastError?.message ?? 'The RPC endpoint did not respond.')
+  );
+}
+
+/**
+ * A JsonRpcProvider that rotates across the network's endpoint list.
+ *
+ * `_send` is the transport seam in ethers v6, so overriding it leaves batching,
+ * response matching, and every higher-level method untouched.
+ */
+class FailoverProvider extends JsonRpcProvider {
+  constructor(urls, network, options) {
+    super(urls[0], network, options);
+    this.adrixUrls = urls;
+  }
+
+  async _send(payload) {
+    const json = await sendWithFailover(this.adrixUrls, payload);
+    return Array.isArray(json) ? json : [json];
+  }
+}
+
+/**
+ * Passthrough for dApp RPC calls the wallet does not handle itself. Goes through
+ * the same rotation as everything else, and preserves the JSON-RPC error shape
+ * so the dApp sees the node's real error code rather than a wrapped one.
+ */
+export async function rpcPassthrough(chainId, method, params) {
+  const network = await getNetwork(chainId);
+  const json = await sendWithFailover(network.rpcUrls, {
+    jsonrpc: '2.0',
+    id: Date.now(),
+    method,
+    params,
+  });
+  const body = Array.isArray(json) ? json[0] : json;
+  if (body?.error) {
+    throw Object.assign(new Error(body.error.message ?? 'RPC error'), {
+      code: body.error.code ?? -32603,
+      data: body.error.data,
+    });
+  }
+  return body?.result;
+}
+
+/** Live endpoint status for one network, for the UI. Never touches the network. */
+export async function peekEndpoints(chainId) {
+  const network = await getNetwork(chainId);
+  const now = Date.now();
+  return network.rpcUrls.map((url, index) => {
+    const state = stateFor(url);
+    return {
+      url,
+      host: hostOf(url),
+      primary: index === 0,
+      resting: state.cooldownUntil > now,
+      cooldownMs: Math.max(0, state.cooldownUntil - now),
+      failures: state.failures,
+      latencyMs: state.latencyMs,
+      lastOkAt: state.lastOkAt,
+      lastError: state.lastError,
+      status: state.cooldownUntil > now ? 'resting' : state.lastOkAt ? 'ok' : 'untried',
+    };
+  });
+}
+
+/** Probes every endpoint of a network independently, for the network editor. */
+export async function checkEndpoints(chainId) {
+  const network = await getNetwork(chainId);
+  return Promise.all(
+    network.rpcUrls.map(async (url, index) => {
+      const started = Date.now();
+      try {
+        const json = await postRpc(url, { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }, 7000);
+        const body = Array.isArray(json) ? json[0] : json;
+        if (body?.error) throw new Error(body.error.message);
+        const latencyMs = Date.now() - started;
+        markOk(url, latencyMs);
+        return {
+          url,
+          host: hostOf(url),
+          primary: index === 0,
+          ok: true,
+          latencyMs,
+          blockNumber: body?.result ? parseInt(body.result, 16) : null,
+        };
+      } catch (err) {
+        markFailure(url, err);
+        return { url, host: hostOf(url), primary: index === 0, ok: false, error: err.message };
+      }
+    })
+  );
+}
+
+export function resetEndpointState(urls) {
+  for (const url of urls ?? []) endpointState.delete(url);
+}
+
+// ---------------------------------------------------------------------------
+// Registry reads
+// ---------------------------------------------------------------------------
+
+const cleanUrl = (value) => String(value ?? '').trim();
+
+function uniqueUrls(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const url = cleanUrl(value);
+    if (!url) continue;
+    const key = url.toLowerCase().replace(/\/+$/, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(url);
+  }
+  return result.slice(0, MAX_RPC_URLS);
+}
+
+/**
+ * Gives every network record both shapes: `rpcUrls` (the list) and `rpc` (the
+ * primary). Records stored before failover existed carry only `rpc`, and the
+ * dApp-facing `wallet_addEthereumChain` still hands over a single URL, so both
+ * have to keep working without a storage migration.
+ */
+function normaliseNetworkRecord(net) {
+  const urls = uniqueUrls([...(net.rpcUrls ?? []), net.rpc]);
+  return { ...net, rpcUrls: urls, rpc: urls[0] ?? '' };
+}
 
 export async function allNetworks() {
   const custom = await local.get('customNetworks', {});
@@ -87,7 +357,7 @@ export async function allNetworks() {
   for (const [chainId, patch] of Object.entries(overrides)) {
     if (merged[chainId]) merged[chainId] = { ...merged[chainId], ...patch, edited: true };
   }
-  return merged;
+  return Object.fromEntries(Object.entries(merged).map(([chainId, net]) => [chainId, normaliseNetworkRecord(net)]));
 }
 
 export function getShowTestnets() {
@@ -125,7 +395,7 @@ export async function getChainId() {
 export async function getNetwork(chainId) {
   const networks = await allNetworks();
   const id = chainId ?? (await getChainId());
-  return networks[id] ?? BUILTIN_NETWORKS[DEFAULT_CHAIN];
+  return networks[id] ?? normaliseNetworkRecord(BUILTIN_NETWORKS[DEFAULT_CHAIN]);
 }
 
 export async function setChain(chainId) {
@@ -135,13 +405,19 @@ export async function setChain(chainId) {
   return networks[chainId];
 }
 
+// ---------------------------------------------------------------------------
+// Registry writes
+// ---------------------------------------------------------------------------
 function validateNetworkInput(network) {
   const chainId = normaliseChainId(network.chainId);
   const name = String(network.name ?? '').trim();
   if (!name) throw new Error('Enter a network name.');
 
-  const rpc = String(network.rpc ?? '').trim();
-  if (!/^https?:\/\//i.test(rpc)) throw new Error('RPC URL must start with http:// or https://.');
+  const rpcUrls = uniqueUrls([...(network.rpcUrls ?? []), network.rpc]);
+  if (!rpcUrls.length) throw new Error('Add at least one RPC URL.');
+  for (const url of rpcUrls) {
+    if (!/^https?:\/\//i.test(url)) throw new Error(`RPC URL must start with http:// or https:// — "${url}" does not.`);
+  }
 
   const explorer = String(network.explorer ?? '').trim();
   if (explorer && !/^https?:\/\//i.test(explorer)) {
@@ -151,7 +427,8 @@ function validateNetworkInput(network) {
   return {
     chainId,
     name,
-    rpc,
+    rpcUrls,
+    rpc: rpcUrls[0],
     symbol: String(network.symbol ?? '').trim() || 'ETH',
     decimals: 18,
     // Trailing slashes double up when explorer links are built, so drop them here.
@@ -184,13 +461,18 @@ export async function editNetwork(chainId, patch) {
   const existing = (await allNetworks())[target];
   if (!existing) throw new Error('Network not found.');
 
-  const clean = validateNetworkInput({ ...existing, ...patch, chainId: target });
+  // An explicit rpcUrls list in the patch replaces the old one outright, rather
+  // than merging — otherwise a removed endpoint would come back.
+  const merged = { ...existing, ...patch, chainId: target };
+  if (patch.rpcUrls) merged.rpcUrls = patch.rpcUrls;
+  const clean = validateNetworkInput(merged);
 
   if (BUILTIN_NETWORKS[target]) {
     const overrides = await local.get('networkOverrides', {});
     overrides[target] = {
       name: clean.name,
       rpc: clean.rpc,
+      rpcUrls: clean.rpcUrls,
       symbol: clean.symbol,
       explorer: clean.explorer,
     };
@@ -201,9 +483,12 @@ export async function editNetwork(chainId, patch) {
     await local.set({ customNetworks: custom });
   }
 
-  // The cached provider is bound to the old RPC URL.
+  // The cached provider is bound to the old endpoint list. Backoff state is
+  // cleared too: editing a network is how a user fixes a broken endpoint, and
+  // they should not have to wait out a cooldown earned by the old URL.
   providerCache.delete(target);
   healthCache.delete(target);
+  resetEndpointState(clean.rpcUrls);
   return (await allNetworks())[target];
 }
 
@@ -216,7 +501,7 @@ export async function resetNetwork(chainId) {
   await local.set({ networkOverrides: overrides });
   providerCache.delete(target);
   healthCache.delete(target);
-  return BUILTIN_NETWORKS[target];
+  return normaliseNetworkRecord(BUILTIN_NETWORKS[target]);
 }
 
 export async function removeNetwork(chainId) {
@@ -232,21 +517,25 @@ export async function removeNetwork(chainId) {
   if ((await getChainId()) === target) await local.set({ chainId: DEFAULT_CHAIN });
 }
 
-// Providers are cached per chain. `staticNetwork` stops ethers from
-// re-detecting the chain on every single call.
+// ---------------------------------------------------------------------------
+// Providers
+// ---------------------------------------------------------------------------
+// Providers are cached per chain, keyed by the endpoint list so an edit rebuilds
+// them. `staticNetwork` stops ethers re-detecting the chain on every call.
 const providerCache = new Map();
 const healthCache = new Map();
 const HEALTH_TTL_MS = 30_000;
 
 export async function getProvider(chainId) {
   const network = await getNetwork(chainId);
+  const key = network.rpcUrls.join('|');
   const cached = providerCache.get(network.chainId);
-  if (cached && cached.rpc === network.rpc) return cached.provider;
+  if (cached && cached.key === key) return cached.provider;
 
-  const provider = new JsonRpcProvider(network.rpc, Network.from(parseInt(network.chainId, 16)), {
+  const provider = new FailoverProvider(network.rpcUrls, Network.from(parseInt(network.chainId, 16)), {
     staticNetwork: true,
   });
-  providerCache.set(network.chainId, { rpc: network.rpc, provider });
+  providerCache.set(network.chainId, { key, provider });
   return provider;
 }
 
@@ -257,11 +546,19 @@ export async function getProvider(chainId) {
  */
 export async function peekNetworkHealth(chainId) {
   const network = await getNetwork(chainId);
+  const key = network.rpcUrls.join('|');
   const cached = healthCache.get(network.chainId);
-  if (cached && cached.rpc === network.rpc) {
+  if (cached && cached.key === key) {
     return { ...cached.health, stale: Date.now() - cached.checkedAt > HEALTH_TTL_MS };
   }
-  return { status: 'unknown', latencyMs: null, blockNumber: null, checkedAt: null, stale: true };
+  return {
+    status: 'unknown',
+    latencyMs: null,
+    blockNumber: null,
+    checkedAt: null,
+    stale: true,
+    endpointCount: network.rpcUrls.length,
+  };
 }
 
 /**
@@ -270,12 +567,15 @@ export async function peekNetworkHealth(chainId) {
  */
 export async function getNetworkHealth(chainId, { force = false } = {}) {
   const network = await getNetwork(chainId);
+  const key = network.rpcUrls.join('|');
   const cached = healthCache.get(network.chainId);
-  if (!force && cached && cached.rpc === network.rpc && Date.now() - cached.checkedAt < HEALTH_TTL_MS) {
+  if (!force && cached && cached.key === key && Date.now() - cached.checkedAt < HEALTH_TTL_MS) {
     return cached.health;
   }
 
   const checkedAt = Date.now();
+  const endpoints = await peekEndpoints(network.chainId);
+
   try {
     const provider = await getProvider(network.chainId);
     const started = Date.now();
@@ -289,6 +589,9 @@ export async function getNetworkHealth(chainId, { force = false } = {}) {
     ]);
 
     const blockAgeMs = block?.timestamp ? Date.now() - block.timestamp * 1000 : null;
+    // Which endpoint actually served the request — the head of the rotation
+    // after the call, since a failover will have reordered it.
+    const live = (await peekEndpoints(network.chainId)).find((entry) => entry.status === 'ok') ?? null;
 
     const health = {
       // A node that answers fast but is behind is worse than a slow current
@@ -306,11 +609,16 @@ export async function getNetworkHealth(chainId, { force = false } = {}) {
       blockAgeMs,
       baseFeePerGas: block?.baseFeePerGas?.toString() ?? null,
       gasPrice: feeData?.gasPrice?.toString() ?? null,
-      rpcHost: hostOf(network.rpc),
+      rpcHost: live?.host ?? hostOf(network.rpcUrls[0]),
+      // A failover that already happened is worth surfacing: the wallet is
+      // working, but not from where the user configured it to.
+      usingFallback: Boolean(live && !live.primary),
+      endpointCount: network.rpcUrls.length,
+      healthyCount: endpoints.filter((entry) => entry.status !== 'resting').length,
       checkedAt,
       stale: false,
     };
-    healthCache.set(network.chainId, { rpc: network.rpc, checkedAt, health });
+    healthCache.set(network.chainId, { key, checkedAt, health });
     return health;
   } catch (err) {
     const health = {
@@ -318,12 +626,14 @@ export async function getNetworkHealth(chainId, { force = false } = {}) {
       latencyMs: null,
       blockNumber: null,
       blockAgeMs: null,
-      rpcHost: hostOf(network.rpc),
+      rpcHost: hostOf(network.rpcUrls[0]),
+      endpointCount: network.rpcUrls.length,
+      healthyCount: 0,
       checkedAt,
       stale: false,
       error: err.shortMessage ?? err.message,
     };
-    healthCache.set(network.chainId, { rpc: network.rpc, checkedAt, health });
+    healthCache.set(network.chainId, { key, checkedAt, health });
     return health;
   }
 }
@@ -354,16 +664,17 @@ const REQUIRED_METHODS = [
   { method: 'eth_estimateGas', params: [{ to: '0x0000000000000000000000000000000000000000', value: '0x0' }], label: 'estimate gas' },
   { method: 'eth_getTransactionCount', params: ['0x0000000000000000000000000000000000000000', 'pending'], label: 'read nonces' },
   { method: 'eth_gasPrice', params: [], label: 'read gas prices' },
+  { method: 'eth_feeHistory', params: ['0x5', 'latest', [50]], label: 'read fee history', optional: true },
 ];
 
 /**
- * Probes an endpoint before it is trusted with the user's addresses and
- * signed transactions. Hard failures throw; everything survivable comes back
- * as a warning so the user can decide.
+ * Probes one endpoint before it is trusted with the user's addresses and signed
+ * transactions. Hard failures throw; everything survivable comes back as a
+ * warning so the user can decide.
  */
 export async function testRpc(network) {
   const chainId = normaliseChainId(network.chainId);
-  const rpc = String(network.rpc ?? '').trim();
+  const rpc = cleanUrl(network.rpc ?? network.rpcUrls?.[0]);
 
   let url;
   try {
@@ -392,7 +703,7 @@ export async function testRpc(network) {
   // error, and it silently produces a network that signs for the wrong chain.
   const existing = await allNetworks();
   const clash = Object.values(existing).find(
-    (net) => net.chainId !== chainId && net.rpc?.trim().toLowerCase() === rpc.toLowerCase()
+    (net) => net.chainId !== chainId && net.rpcUrls.some((entry) => entry.toLowerCase() === rpc.toLowerCase())
   );
   if (clash) warnings.push(`This same URL is already used by "${clash.name}" (${clash.chainId}).`);
 
@@ -423,16 +734,22 @@ export async function testRpc(network) {
   // Method support and head freshness, both best-effort.
   const [methodResults, head, clientVersion] = await Promise.all([
     Promise.all(
-      REQUIRED_METHODS.map(async ({ method, params, label }) => {
+      REQUIRED_METHODS.map(async ({ method, params, label, optional }) => {
         try {
           await withTimeout(provider.send(method, params), 6000, 'timed out');
-          return { method, label, ok: true };
+          return { method, label, optional: Boolean(optional), ok: true };
         } catch (err) {
           // A revert from eth_call still proves the method is served; only a
           // "method not found" style failure counts as unsupported.
           const message = String(err?.message ?? '');
           const unsupported = /not (found|supported|available)|unsupported|-32601|does not exist/i.test(message);
-          return { method, label, ok: !unsupported, error: unsupported ? message : null };
+          return {
+            method,
+            label,
+            optional: Boolean(optional),
+            ok: !unsupported,
+            error: unsupported ? message : null,
+          };
         }
       })
     ),
@@ -440,9 +757,14 @@ export async function testRpc(network) {
     withTimeout(provider.send('web3_clientVersion', []), 4000, 'timed out').catch(() => null),
   ]);
 
-  const missing = methodResults.filter((result) => !result.ok);
+  const missing = methodResults.filter((result) => !result.ok && !result.optional);
   if (missing.length) {
     warnings.push(`This endpoint cannot ${missing.map((m) => m.label).join(', ')}. The wallet needs those.`);
+  }
+  // Fee history drives the base-fee chart and the inclusion estimates. Losing it
+  // degrades those to a flat guess rather than breaking anything.
+  if (methodResults.some((result) => result.optional && !result.ok)) {
+    warnings.push('This endpoint does not serve eth_feeHistory, so fee trends and time estimates will be approximate.');
   }
 
   const blockAgeMs = head?.timestamp ? Date.now() - head.timestamp * 1000 : null;

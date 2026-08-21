@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { accountColor, call, jazziconData, shorten, t, timeAgo } from '../../lib/ui.js';
+import { accountColor, call, formatEta, formatGwei, jazziconData, shorten, t, timeAgo } from '../../lib/ui.js';
 
 // ---------------------------------------------------------------------------
 // Avatars
@@ -67,7 +67,7 @@ export function Avatar({ address, size = 'sm', src = '', className = '' }) {
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
-export function TopBar({ state, onOpenAccounts, onOpenNetworks, onOpenSettings, pending = 0 }) {
+export function TopBar({ state, onOpenAccounts, onOpenNetworks, onOpenSettings, onOpenSearch, pending = 0 }) {
   const account = state.accounts.find((a) => a.address === state.selected);
   const health = state.networkHealth;
 
@@ -88,6 +88,12 @@ export function TopBar({ state, onOpenAccounts, onOpenNetworks, onOpenSettings, 
           ▼
         </span>
       </button>
+
+      {onOpenSearch && (
+        <button className="icon-btn plain" onClick={onOpenSearch} title="Search everything" aria-label="Search everything">
+          ⌕
+        </button>
+      )}
 
       <button className="icon-btn plain" onClick={onOpenSettings} title={t('settings.title')} aria-label={t('settings.title')}>
         ☰
@@ -115,6 +121,7 @@ function networkHealthTitle(health) {
 export function NetworkHealthPanel({ chainId, name, initial = null }) {
   const [health, setHealth] = useState(initial);
   const [checking, setChecking] = useState(false);
+  const [endpoints, setEndpoints] = useState([]);
 
   const check = useCallback(async () => {
     setChecking(true);
@@ -123,6 +130,11 @@ export function NetworkHealthPanel({ chainId, name, initial = null }) {
     } catch (err) {
       setHealth({ status: 'offline', error: err.message, checkedAt: Date.now() });
     } finally {
+      // Endpoint states are a by-product of the probe above, so they are read
+      // after it rather than triggering their own round of requests.
+      call('PEEK_ENDPOINTS', { chainId })
+        .then((result) => setEndpoints(result.endpoints ?? []))
+        .catch(() => setEndpoints([]));
       setChecking(false);
     }
   }, [chainId]);
@@ -195,7 +207,46 @@ export function NetworkHealthPanel({ chainId, name, initial = null }) {
         </>
       )}
 
-      {health?.checkedAt && <p className="small faint">Checked {timeAgo(health.checkedAt)}.</p>}
+      {health?.usingFallback && (
+        <div className="notice">
+          The primary endpoint is not answering, so ADRIX has fallen back to <b>{health.rpcHost}</b>. Everything still
+          works; reorder the list in the network editor if you want this one first.
+        </div>
+      )}
+
+      {endpoints.length > 1 && (
+        <div className="stack-sm">
+          <div className="between">
+            <span className="eyebrow">Endpoints</span>
+            <span className="small faint">
+              {endpoints.filter((entry) => entry.status !== 'resting').length} of {endpoints.length} available
+            </span>
+          </div>
+          {endpoints.map((entry) => (
+            <div className="endpoint-row" key={entry.url}>
+              <span className={`dot health ${entry.status === 'ok' ? 'good' : entry.status === 'resting' ? 'offline' : 'unknown'}`} />
+              <div className="item-main">
+                <span className="item-title mono small">{entry.host}</span>
+                <span className="item-sub">
+                  {entry.status === 'resting'
+                    ? `backing off ${Math.ceil(entry.cooldownMs / 1000)}s after ${entry.failures} failure${entry.failures === 1 ? '' : 's'}`
+                    : entry.latencyMs != null
+                      ? `${entry.latencyMs}ms · last ok ${timeAgo(entry.lastOkAt)}`
+                      : 'not tried yet'}
+                </span>
+              </div>
+              {entry.primary && <span className="badge">primary</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {health?.checkedAt && (
+        <p className="small faint">
+          Checked {timeAgo(health.checkedAt)}
+          {endpoints.length > 1 ? ` · failover across ${endpoints.length} endpoints` : ''}.
+        </p>
+      )}
     </div>
   );
 }
@@ -223,13 +274,227 @@ function latencyTone(latency) {
   return 'bad';
 }
 
-function formatGwei(wei) {
+// ---------------------------------------------------------------------------
+// Sparkline
+//
+// A plain inline SVG: no chart library, no runtime, and it inherits the theme
+// through currentColor so it works in both palettes without a second definition.
+// ---------------------------------------------------------------------------
+export function Sparkline({ values = [], width = 260, height = 46, ariaLabel, className = '' }) {
+  const numbers = values.map(Number).filter((value) => Number.isFinite(value));
+  if (numbers.length < 2) return null;
+
+  const min = Math.min(...numbers);
+  const max = Math.max(...numbers);
+  // A perfectly flat series would divide by zero and, worse, render as a line
+  // pinned to the top of the box. Flat data should look flat and centred.
+  const span = max - min || 1;
+  const pad = 3;
+  const stepX = width / (numbers.length - 1);
+  const yFor = (value) =>
+    max === min ? height / 2 : height - pad - ((value - min) / span) * (height - pad * 2);
+
+  const points = numbers.map((value, index) => `${(index * stepX).toFixed(2)},${yFor(value).toFixed(2)}`);
+  const last = numbers[numbers.length - 1];
+
+  return (
+    <svg
+      className={`sparkline ${className}`}
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      role="img"
+      aria-label={ariaLabel ?? `Trend across ${numbers.length} points`}
+    >
+      <polygon className="sparkline-area" points={`0,${height} ${points.join(' ')} ${width},${height}`} />
+      <polyline className="sparkline-line" points={points.join(' ')} />
+      <circle className="sparkline-head" cx={width} cy={yFor(last)} r="2.6" />
+    </svg>
+  );
+}
+
+/**
+ * Recent base fee movement, so the choice between sending now and waiting is
+ * made against data rather than a guess. Renders nothing when the endpoint does
+ * not serve eth_feeHistory — an empty chart is worse than no chart.
+ */
+export function BaseFeePanel({ feeHistory, compact = false }) {
+  if (!feeHistory?.supported || !feeHistory.baseFees?.length) return null;
+
+  // A throw inside render blanks the whole popup, so a malformed series is
+  // dropped rather than trusted — the chart is the least important thing here.
+  let gwei;
   try {
-    const gwei = Number(BigInt(wei)) / 1e9;
-    return gwei < 0.01 ? gwei.toExponential(1) : gwei.toFixed(gwei < 10 ? 2 : 0);
+    gwei = feeHistory.baseFees.map((wei) => Number(BigInt(wei)) / 1e9);
   } catch {
-    return '--';
+    return null;
   }
+  if (!gwei.every((value) => Number.isFinite(value))) return null;
+  const { direction, percent } = feeHistory.trend ?? {};
+  const congestionPercent = Math.round((feeHistory.congestion ?? 0) * 100);
+
+  const arrow = direction === 'rising' ? '▲' : direction === 'falling' ? '▼' : '▬';
+  const tone = direction === 'rising' ? 'warn' : direction === 'falling' ? 'good' : '';
+
+  return (
+    <div className="card fee-history">
+      <div className="between">
+        <span className="eyebrow">Base fee · last {gwei.length} blocks</span>
+        <span className={`badge ${tone === 'good' ? 'confirmed' : tone === 'warn' ? 'pending' : ''}`}>
+          {arrow} {percent > 0 ? '+' : ''}
+          {percent}%
+        </span>
+      </div>
+
+      <Sparkline
+        values={gwei}
+        ariaLabel={`Base fee over the last ${gwei.length} blocks, ${direction}, currently ${formatGwei(feeHistory.nextBaseFee)} gwei`}
+      />
+
+      <div className="fee-history-stats">
+        <div className="fee-stat">
+          <span className="fee-stat-value">{formatGwei(feeHistory.nextBaseFee)}</span>
+          <span className="fee-stat-label">Next block</span>
+        </div>
+        <div className="fee-stat">
+          <span className="fee-stat-value">{formatGwei(feeHistory.median)}</span>
+          <span className="fee-stat-label">Median</span>
+        </div>
+        <div className="fee-stat">
+          <span className="fee-stat-value">
+            {formatGwei(feeHistory.min)}–{formatGwei(feeHistory.max)}
+          </span>
+          <span className="fee-stat-label">Range (gwei)</span>
+        </div>
+        {!compact && (
+          <div className={`fee-stat ${congestionPercent > 90 ? 'warn' : ''}`}>
+            <span className="fee-stat-value">{congestionPercent}%</span>
+            <span className="fee-stat-label">Blocks full</span>
+          </div>
+        )}
+      </div>
+
+      {feeHistory.advice && (
+        <div className={`notice ${feeHistory.advice.action === 'wait' ? '' : 'info'}`}>{feeHistory.advice.message}</div>
+      )}
+
+      {!compact && (
+        <p className="small faint">
+          Blocks average {feeHistory.blockTimeSeconds}s here. Time estimates come from the priority fees paid in these
+          blocks — they are an observation, not a guarantee.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The blocking-nonce warning.
+ *
+ * Nonces execute in order, so one missing number freezes everything after it
+ * forever. That is invisible from the outside — the transactions simply sit
+ * there — so this states the cause, names what is stuck, and offers the fix.
+ */
+export function NonceGapWarning({ info, onFill, busy = false }) {
+  if (!info?.gaps?.length) return null;
+
+  const gap = info.firstGap ?? info.gaps[0];
+  const blocked = info.blocked ?? [];
+
+  return (
+    <div className="notice danger nonce-gap">
+      <b>Nonce {gap} is missing, and it is blocking the queue.</b>
+      <p className="small">
+        Transactions confirm strictly in nonce order. Nothing was ever broadcast at nonce {gap}, so
+        {blocked.length > 0
+          ? ` the ${blocked.length} transaction${blocked.length === 1 ? '' : 's'} queued behind it cannot be mined`
+          : ' anything queued behind it cannot be mined'}
+        {info.gaps.length > 1 ? ` (${info.gaps.length} nonces are missing in total)` : ''}.
+      </p>
+
+      {blocked.length > 0 && (
+        <ul className="plain-list small nonce-gap-list">
+          {blocked.slice(0, 4).map((tx) => (
+            <li key={tx.hash}>
+              nonce {tx.nonce} · {tx.label} · waiting {timeAgo(tx.submittedAt)}
+            </li>
+          ))}
+          {blocked.length > 4 && <li className="faint">+{blocked.length - 4} more</li>}
+        </ul>
+      )}
+
+      {onFill && (
+        <button className="ghost" onClick={() => onFill(gap)} disabled={busy}>
+          {busy ? 'Pricing…' : `Fill nonce ${gap} and unblock`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** A pending transaction whose max fee can no longer clear the base fee. */
+export function UnderpricedWarning({ info, onSpeedUp, busy = false }) {
+  const stuck = info?.underpriced ?? [];
+  if (!stuck.length) return null;
+
+  return (
+    <div className="notice">
+      <b>
+        {stuck.length} pending transaction{stuck.length === 1 ? '' : 's'} priced below the current base fee.
+      </b>
+      <p className="small">
+        The base fee has risen to {formatGwei(info.baseFeePerGas)} gwei since {stuck.length === 1 ? 'it was' : 'they were'}{' '}
+        sent. A transaction whose max fee is below the base fee cannot be included at any point — it will sit there
+        until the base fee falls back, or until you replace it at a higher fee.
+      </p>
+      {onSpeedUp && (
+        <button className="ghost" onClick={() => onSpeedUp(stuck[0].hash)} disabled={busy}>
+          {busy ? 'Working…' : `Speed up nonce ${stuck[0].nonce}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Fee presets, shared by every screen that submits a transaction. */
+export function GasPresetGrid({ gasInfo, preset, onSelect, disabled = false }) {
+  if (!gasInfo?.options) return null;
+
+  return (
+    <div className="gas-grid">
+      {['low', 'market', 'fast'].map((key) => {
+        const option = gasInfo.options[key];
+        if (!option) return null;
+        return (
+          <button
+            key={key}
+            className="gas-option"
+            aria-pressed={preset === key}
+            disabled={disabled}
+            onClick={() => onSelect(key)}
+          >
+            <b>{key === 'low' ? 'Slow' : key === 'market' ? 'Market' : 'Fast'}</b>
+            <span>~{trimFee(option.likelyFee ?? option.estimatedFee)}</span>
+            {option.etaSeconds != null && (
+              <span className="eta">
+                ~{formatEta(option.etaSeconds)}
+                {/* A block count is a firmer claim than a clock reading, so show
+                    it when the estimate came from real fee history. */}
+                {option.etaBlocks ? ` · ${option.etaBlocks} blk` : ''}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function trimFee(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '--';
+  if (number === 0) return '0';
+  if (number < 0.000001) return '<0.000001';
+  return number.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
 export function BackBar({ title, onBack, right = null }) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { setLocale, getLocale, t } from './i18n.js';
 
 export async function call(type, payload = {}) {
@@ -111,6 +111,60 @@ export function formatFiat(value, currency = 'usd', { placeholder = '--' } = {})
 }
 
 export const currencySymbol = (code) => CURRENCY_SYMBOLS[String(code).toLowerCase()] ?? '';
+
+/** Wei → gwei for display. Sub-0.01 gwei chains exist, so precision adapts. */
+export function formatGwei(wei, places) {
+  if (wei == null) return '--';
+  try {
+    const gwei = Number(BigInt(wei)) / 1e9;
+    if (gwei === 0) return '0';
+    if (gwei < 0.001) return gwei.toExponential(1);
+    return gwei.toLocaleString(undefined, { maximumFractionDigits: places ?? (gwei < 1 ? 4 : gwei < 100 ? 2 : 0) });
+  } catch {
+    return '--';
+  }
+}
+
+/** "12s", "~2 min", "~1 hr" — the granularity people actually think in. */
+export function formatEta(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return '';
+  const value = Number(seconds);
+  if (value < 60) return `${Math.max(1, Math.round(value))}s`;
+  if (value < 3600) return `${Math.round(value / 60)} min`;
+  return `${Math.round((value / 3600) * 10) / 10} hr`;
+}
+
+/**
+ * Mirror of the background's inclusion model, so the review screen can re-time a
+ * hand-entered priority fee as it is typed rather than after a round trip. The
+ * background copy is the authority; this one only drives the UI.
+ */
+export function estimateInclusion(priorityWei, feeHistory) {
+  if (!feeHistory?.supported) return null;
+  const blockTime = feeHistory.blockTimeSeconds ?? 12;
+
+  let priority;
+  try {
+    priority = BigInt(priorityWei ?? 0);
+  } catch {
+    return null;
+  }
+
+  const { low, market, fast } = feeHistory.rewards ?? {};
+  if (!fast || BigInt(fast) === 0n) return null;
+
+  let blocks;
+  if (priority >= BigInt(fast)) blocks = 1;
+  else if (priority >= BigInt(market)) blocks = 2;
+  else if (priority >= BigInt(low)) blocks = 5;
+  else blocks = 12;
+
+  const congestion = feeHistory.congestion ?? 0.5;
+  if (congestion > 0.9) blocks *= 2;
+  else if (congestion < 0.4) blocks = Math.max(1, Math.round(blocks * 0.6));
+
+  return { blocks, seconds: Math.max(1, Math.round(blocks * blockTime)) };
+}
 
 export function timeAgo(timestamp) {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -226,6 +280,138 @@ export function useDebounced(value, delay = 400) {
     return () => clearTimeout(timer);
   }, [value, delay]);
   return debounced;
+}
+
+/**
+ * Polling that pauses when the page is hidden and backs off when it fails.
+ *
+ * A fixed setInterval keeps hammering the RPC while the popup sits behind
+ * another window, and on a failing endpoint it retries at full rate forever.
+ * Returns the refresh state the UI needs to show what is happening, because a
+ * balance that silently stops updating is worse than one that says so.
+ */
+export function useAutoRefresh(fn, { interval = 15000, enabled = true, deps = [] } = {}) {
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastAt, setLastAt] = useState(null);
+  const [failures, setFailures] = useState(0);
+  const busyRef = useRef(false);
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+
+  const refresh = useCallback(async ({ manual = false } = {}) => {
+    // A manual tap while a poll is in flight should not stack a second read.
+    if (busyRef.current) return;
+    busyRef.current = true;
+    if (manual) setRefreshing(true);
+    try {
+      await fnRef.current();
+      setLastAt(Date.now());
+      setFailures(0);
+    } catch {
+      setFailures((count) => count + 1);
+    } finally {
+      busyRef.current = false;
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let timer = null;
+
+    const schedule = () => {
+      clearTimeout(timer);
+      if (document.hidden) return;
+      // Exponential backoff to a 2-minute ceiling. A dead endpoint should cost
+      // one request every couple of minutes, not four a minute.
+      const delay = failures ? Math.min(120_000, interval * 2 ** Math.min(failures, 3)) : interval;
+      timer = setTimeout(async () => {
+        await refresh();
+        schedule();
+      }, delay);
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        clearTimeout(timer);
+      } else {
+        // Coming back to a stale number is the moment a refresh is most wanted.
+        refresh();
+        schedule();
+      }
+    };
+
+    schedule();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [enabled, interval, failures, refresh, ...deps]);
+
+  // Memoised: this identity is a dependency of the pull-to-refresh listener
+  // effect, and a fresh arrow each render would rebind touch handlers
+  // constantly.
+  const manualRefresh = useCallback(() => refresh({ manual: true }), [refresh]);
+
+  return { refresh: manualRefresh, refreshing, lastAt, failures };
+}
+
+/**
+ * Pull-to-refresh for a scroll container.
+ *
+ * Only arms at the very top of the scroll area, so a normal upward flick in the
+ * middle of a long list is never mistaken for a refresh gesture.
+ */
+export function usePullToRefresh(ref, onRefresh, { threshold = 64, enabled = true } = {}) {
+  const [pull, setPull] = useState(0);
+  const [armed, setArmed] = useState(false);
+  const startRef = useRef(null);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node || !enabled) return undefined;
+
+    const onStart = (event) => {
+      if (node.scrollTop > 0) return;
+      startRef.current = event.touches[0].clientY;
+    };
+
+    const onMove = (event) => {
+      if (startRef.current == null) return;
+      const delta = event.touches[0].clientY - startRef.current;
+      if (delta <= 0) {
+        startRef.current = null;
+        setPull(0);
+        setArmed(false);
+        return;
+      }
+      // Resistance, so the sheet does not track the finger one-to-one and the
+      // gesture feels like it is pulling against something.
+      const eased = Math.min(threshold * 1.5, delta * 0.5);
+      setPull(eased);
+      setArmed(eased >= threshold * 0.8);
+      if (event.cancelable) event.preventDefault();
+    };
+
+    const onEnd = () => {
+      if (armed) onRefresh();
+      startRef.current = null;
+      setPull(0);
+      setArmed(false);
+    };
+
+    node.addEventListener('touchstart', onStart, { passive: true });
+    node.addEventListener('touchmove', onMove, { passive: false });
+    node.addEventListener('touchend', onEnd);
+    return () => {
+      node.removeEventListener('touchstart', onStart);
+      node.removeEventListener('touchmove', onMove);
+      node.removeEventListener('touchend', onEnd);
+    };
+  }, [ref, onRefresh, threshold, enabled, armed]);
+
+  return { pull, armed };
 }
 
 /** True while the browser reports the extension page is offline. */

@@ -2,12 +2,12 @@ import { useState } from 'react';
 import { call, useAsyncAction } from '../../lib/ui.js';
 import { BackBar, EmptyState, NetworkHealthPanel } from '../components/common.jsx';
 
-const EMPTY = { name: '', chainId: '', rpc: '', symbol: '', explorer: '', testnet: false };
+const MAX_RPC_URLS = 6;
+const EMPTY = { name: '', chainId: '', rpcUrls: [''], symbol: '', explorer: '', testnet: false };
 
 const FIELD_LABELS = {
   name: 'Network name',
   chainId: 'Chain ID',
-  rpc: 'RPC URL',
   symbol: 'Currency symbol',
   explorer: 'Block explorer URL (optional)',
 };
@@ -15,7 +15,6 @@ const FIELD_LABELS = {
 const PLACEHOLDERS = {
   name: 'My network',
   chainId: '0x1 or 1',
-  rpc: 'https://…',
   symbol: 'ETH',
   explorer: 'https://etherscan.io',
 };
@@ -100,7 +99,10 @@ export default function Networks({ state, go, refresh }) {
                     <span className="item-sub">
                       {network.chainId} · {network.symbol}
                     </span>
-                    <span className="item-sub">{hostOf(network.rpc)}</span>
+                    <span className="item-sub">
+                      {hostOf(network.rpc)}
+                      {network.rpcUrls?.length > 1 && ` +${network.rpcUrls.length - 1} fallback`}
+                    </span>
                   </div>
                   <span className="item-right">
                     {network.testnet && <span className="badge">testnet</span>}
@@ -138,20 +140,27 @@ function NetworkForm({ network, onCancel, onSaved }) {
       ? {
           name: network.name ?? '',
           chainId: network.chainId ?? '',
-          rpc: network.rpc ?? '',
+          rpcUrls: network.rpcUrls?.length ? [...network.rpcUrls] : [network.rpc ?? ''],
           symbol: network.symbol ?? '',
           explorer: network.explorer ?? '',
           testnet: Boolean(network.testnet),
         }
       : EMPTY
   );
-  const [testResult, setTestResult] = useState(null);
+  // url -> test result. Keyed by URL rather than index so reordering the list
+  // does not reassign one endpoint's verdict to another.
+  const [testResults, setTestResults] = useState({});
+  const [testing, setTesting] = useState('');
   const { busy, error, setError, run } = useAsyncAction();
 
-  // Editing an existing network only needs a re-test when the RPC changes;
-  // adding one always does, because an unverified RPC can lie about its chain.
-  const rpcChanged = !isEdit || form.rpc !== network.rpc;
-  const needsTest = rpcChanged && !(testResult?.ok && testResult.rpc === form.rpc);
+  const originalUrls = new Set(isEdit ? (network.rpcUrls ?? [network.rpc]) : []);
+  const filledUrls = form.rpcUrls.map((url) => url.trim()).filter(Boolean);
+
+  // Every endpoint the user has not already been running must prove itself
+  // before it is saved: an unverified RPC can serve a different chain, and the
+  // wallet would then sign against the wrong one.
+  const untested = filledUrls.filter((url) => !originalUrls.has(url) && !testResults[url]?.ok);
+  const needsTest = untested.length > 0;
 
   const hexChainId = () => {
     const raw = String(form.chainId).trim();
@@ -161,22 +170,83 @@ function NetworkForm({ network, onCancel, onSaved }) {
 
   const update = (key, value) => {
     setForm((current) => ({ ...current, [key]: value }));
-    if (key === 'rpc' || key === 'chainId') setTestResult(null);
+    // A chain ID change invalidates every verdict — each one was a check that
+    // the endpoint serves *that* chain.
+    if (key === 'chainId') setTestResults({});
     setError('');
   };
 
-  const testRpc = () =>
+  const updateUrl = (index, value) => {
+    setForm((current) => {
+      const next = [...current.rpcUrls];
+      next[index] = value;
+      return { ...current, rpcUrls: next };
+    });
+    setError('');
+  };
+
+  const addUrl = () =>
+    setForm((current) =>
+      current.rpcUrls.length >= MAX_RPC_URLS ? current : { ...current, rpcUrls: [...current.rpcUrls, ''] }
+    );
+
+  const removeUrl = (index) =>
+    setForm((current) => ({
+      ...current,
+      rpcUrls: current.rpcUrls.length > 1 ? current.rpcUrls.filter((_, i) => i !== index) : current.rpcUrls,
+    }));
+
+  const promoteUrl = (index) =>
+    setForm((current) => {
+      const next = [...current.rpcUrls];
+      const [moved] = next.splice(index, 1);
+      return { ...current, rpcUrls: [moved, ...next] };
+    });
+
+  const testUrl = (url) =>
     run(async () => {
-      const result = await call('TEST_RPC', { network: { ...form, chainId: hexChainId() } });
-      setTestResult({ ...result, rpc: form.rpc });
+      setTesting(url);
+      try {
+        const result = await call('TEST_RPC', { network: { ...form, rpc: url, chainId: hexChainId() } });
+        setTestResults((current) => ({ ...current, [url]: { ...result, rpc: url } }));
+      } catch (err) {
+        setTestResults((current) => ({ ...current, [url]: { ok: false, rpc: url, error: err.message } }));
+        throw err;
+      } finally {
+        setTesting('');
+      }
+    });
+
+  const testAll = () =>
+    run(async () => {
+      for (const url of filledUrls) {
+        setTesting(url);
+        try {
+          const result = await call('TEST_RPC', { network: { ...form, rpc: url, chainId: hexChainId() } });
+          setTestResults((current) => ({ ...current, [url]: { ...result, rpc: url } }));
+        } catch (err) {
+          // One bad endpoint should not abort the sweep — the point is to find
+          // out which of them work.
+          setTestResults((current) => ({ ...current, [url]: { ok: false, rpc: url, error: err.message } }));
+        }
+      }
+      setTesting('');
     });
 
   const save = () =>
     run(async () => {
       const chainId = hexChainId();
-      if (needsTest) throw new Error('Test the RPC URL before saving.');
-      if (isEdit) await call('EDIT_NETWORK', { chainId, network: form });
-      else await call('ADD_NETWORK', { network: { ...form, chainId } });
+      if (!filledUrls.length) throw new Error('Add at least one RPC URL.');
+      if (needsTest) {
+        throw new Error(
+          untested.length === 1
+            ? 'Test the new RPC endpoint before saving.'
+            : `Test the ${untested.length} new RPC endpoints before saving.`
+        );
+      }
+      const payload = { ...form, rpcUrls: filledUrls, rpc: filledUrls[0] };
+      if (isEdit) await call('EDIT_NETWORK', { chainId, network: payload });
+      else await call('ADD_NETWORK', { network: { ...payload, chainId } });
       await onSaved();
     });
 
@@ -196,7 +266,7 @@ function NetworkForm({ network, onCancel, onSaved }) {
     <div className="screen">
       <BackBar title={isEdit ? 'Edit network' : 'Add a network'} onBack={onCancel} />
       <div className="scroll pad stack">
-        {(['name', 'chainId', 'rpc', 'symbol', 'explorer']).map((key) => (
+        {(['name', 'chainId']).map((key) => (
           <label className="field" key={key}>
             <span>{FIELD_LABELS[key]}</span>
             <input
@@ -213,6 +283,33 @@ function NetworkForm({ network, onCancel, onSaved }) {
                 Chain ID cannot change — tokens, permissions, and history are keyed to it.
               </span>
             )}
+          </label>
+        ))}
+
+        <RpcEndpoints
+          urls={form.rpcUrls}
+          results={testResults}
+          testing={testing}
+          busy={busy}
+          knownUrls={originalUrls}
+          onChange={updateUrl}
+          onAdd={addUrl}
+          onRemove={removeUrl}
+          onPromote={promoteUrl}
+          onTest={testUrl}
+          onTestAll={testAll}
+        />
+
+        {(['symbol', 'explorer']).map((key) => (
+          <label className="field" key={key}>
+            <span>{FIELD_LABELS[key]}</span>
+            <input
+              className="mono"
+              value={form[key]}
+              placeholder={PLACEHOLDERS[key]}
+              onChange={(e) => update(key, e.target.value)}
+              spellCheck="false"
+            />
             {key === 'explorer' && (
               <span className="small faint">Used for the "view" links on transactions and addresses.</span>
             )}
@@ -226,7 +323,7 @@ function NetworkForm({ network, onCancel, onSaved }) {
           </label>
         )}
 
-        {testResult?.ok && <RpcTestResult result={testResult} />}
+        {filledUrls.map((url) => testResults[url]?.ok && <RpcTestResult key={url} result={testResults[url]} />)}
         {error && <div className="error" role="alert">{error}</div>}
 
         <p className="small">
@@ -250,14 +347,112 @@ function NetworkForm({ network, onCancel, onSaved }) {
 
       <div className="footer">
         <div className="row2">
-          <button className="ghost" onClick={testRpc} disabled={busy || !form.rpc || !form.chainId}>
-            {busy ? 'Testing…' : 'Test RPC'}
+          <button className="ghost" onClick={testAll} disabled={busy || !filledUrls.length || !form.chainId}>
+            {busy ? 'Testing…' : filledUrls.length > 1 ? `Test all ${filledUrls.length}` : 'Test RPC'}
           </button>
-          <button className="primary" onClick={save} disabled={busy || !form.name || !form.rpc || needsTest}>
+          <button className="primary" onClick={save} disabled={busy || !form.name || !filledUrls.length || needsTest}>
             {isEdit ? 'Save changes' : 'Add network'}
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The endpoint list.
+ *
+ * Order is meaningful: the first entry is tried first and the rest are failover,
+ * so promoting one is a real setting rather than cosmetic sorting. Each is
+ * tested on its own, because "the network works" and "this particular endpoint
+ * works" are different claims and only the second one is checkable here.
+ */
+function RpcEndpoints({ urls, results, testing, busy, knownUrls, onChange, onAdd, onRemove, onPromote, onTest, onTestAll }) {
+  const filled = urls.filter((url) => url.trim());
+  const passing = filled.filter((url) => results[url]?.ok).length;
+
+  return (
+    <div className="card">
+      <div className="between">
+        <h2>RPC endpoints</h2>
+        {filled.length > 1 && (
+          <button className="link accent" onClick={onTestAll} disabled={busy}>
+            test all
+          </button>
+        )}
+      </div>
+      <p className="small">
+        Tried in order. If the first stops answering, ADRIX moves to the next automatically and backs off the failed one
+        for a while — a rate-limited public endpoint stops being an outage.
+      </p>
+
+      {urls.map((url, index) => {
+        const trimmed = url.trim();
+        const result = results[trimmed];
+        const isTesting = testing === trimmed;
+        const known = knownUrls.has(trimmed);
+
+        return (
+          <div className="endpoint-edit" key={index}>
+            <div className="between">
+              <span className="eyebrow">{index === 0 ? 'Primary' : `Fallback ${index}`}</span>
+              <span className="inline">
+                {index > 0 && (
+                  <button className="link" onClick={() => onPromote(index)} title="Try this one first">
+                    make primary
+                  </button>
+                )}
+                {urls.length > 1 && (
+                  <button className="link" onClick={() => onRemove(index)}>
+                    remove
+                  </button>
+                )}
+              </span>
+            </div>
+
+            <div className="input-group">
+              <input
+                className="mono"
+                value={url}
+                placeholder="https://…"
+                onChange={(e) => onChange(index, e.target.value)}
+                spellCheck="false"
+                aria-label={index === 0 ? 'Primary RPC URL' : `Fallback RPC URL ${index}`}
+              />
+              <button className="ghost" onClick={() => onTest(trimmed)} disabled={busy || !trimmed}>
+                {isTesting ? '…' : 'Test'}
+              </button>
+            </div>
+
+            {result?.ok ? (
+              <span className="badge confirmed">
+                ✓ chain matches · {result.latencyMs}ms · block {result.blockNumber}
+              </span>
+            ) : result ? (
+              <div className="error small">{result.error}</div>
+            ) : known ? (
+              <span className="small faint">Already in use — no re-test needed unless you change it.</span>
+            ) : trimmed ? (
+              <span className="small faint">Not tested yet.</span>
+            ) : null}
+          </div>
+        );
+      })}
+
+      {urls.length < MAX_RPC_URLS ? (
+        <button className="ghost" onClick={onAdd}>
+          + Add a fallback endpoint
+        </button>
+      ) : (
+        <p className="small faint">Six endpoints is the maximum.</p>
+      )}
+
+      {filled.length > 1 && (
+        <p className="small faint">
+          {passing} of {filled.length} verified. Every endpoint you add can see the addresses you query, so add only
+          ones you would be willing to use on their own.
+        </p>
+      )}
     </div>
   );
 }

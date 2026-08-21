@@ -2227,3 +2227,303 @@ button.nft-card {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* --- sparkline & fee history ---------------------------------------------- */
+.sparkline {
+  display: block;
+  width: 100%;
+  height: 46px;
+  overflow: visible;
+  color: var(--accent);
+}
+
+.sparkline-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  /* preserveAspectRatio="none" stretches the viewBox, which would otherwise
+     scale the stroke horizontally and leave it visibly thinner than it is tall. */
+  vector-effect: non-scaling-stroke;
+}
+
+.sparkline-area {
+  fill: currentColor;
+  opacity: 0.1;
+  stroke: none;
+}
+
+.sparkline-head {
+  fill: currentColor;
+  stroke: var(--surface);
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+}
+
+/* auto-fit rather than a fixed count: the compact variant drops the congestion
+   stat, and the remaining three should spread instead of leaving a hole. */
+.fee-history-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(58px, 1fr));
+  gap: 6px;
+}
+
+.fee-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.fee-stat-value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fee-stat-label {
+  font-size: 9.5px;
+  color: var(--faint);
+  letter-spacing: 0.02em;
+}
+
+.fee-stat.warn .fee-stat-value {
+  color: var(--warn);
+}
+
+/* A custom fee overrides the presets, so they read as inactive rather than
+   silently continuing to look selectable. */
+.dimmed {
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+
+/* --- nonce gap ------------------------------------------------------------ */
+.nonce-gap {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  align-items: flex-start;
+}
+
+.nonce-gap-list {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--mono);
+  color: var(--muted);
+}
+
+.item.static.blocked {
+  border-left: 2px solid var(--danger);
+  padding-left: 10px;
+}
+
+.banner-icon {
+  font-size: 15px;
+  line-height: 1;
+  color: var(--danger);
+}
+
+/* --- RPC endpoints -------------------------------------------------------- */
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.endpoint-row:first-of-type {
+  border-top: 0;
+}
+
+.endpoint-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+
+.endpoint-edit:first-of-type {
+  border-top: 0;
+  padding-top: 2px;
+}
+
+/* --- NFT collection floor -------------------------------------------------- */
+.floor-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.floor-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.floor-value {
+  font-family: var(--mono);
+  font-size: 19px;
+  font-weight: 640;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.floor-label {
+  font-size: 10px;
+  color: var(--faint);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.floor-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+/* --- token list results ---------------------------------------------------- */
+.token-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  object-fit: cover;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+
+.item.static.flagged {
+  border-left: 2px solid var(--danger);
+  padding-left: 10px;
+}
+
+/* --- chain switch / add prompt --------------------------------------------- */
+.chain-hop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.chain-hop-side {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.chain-hop-label {
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.chain-hop-name {
+  font-size: 13.5px;
+  font-weight: 640;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chain-hop-meta {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.chain-hop-arrow {
+  flex: 0 0 auto;
+  font-size: 16px;
+  color: var(--accent);
+}
+
+/* The destination is the half that matters, so it is the half that is coloured. */
+.chain-hop-side:last-of-type .chain-hop-name {
+  color: var(--accent);
+}
+
+/* --- refresh affordances ---------------------------------------------------- */
+.hero-refresh {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 4px;
+  min-height: 18px;
+}
+
+@keyframes adrix-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin {
+  display: inline-block;
+  animation: adrix-spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}
+
+.pull-indicator {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  font-size: 11px;
+  color: var(--faint);
+  transition: none;
+}
+
+.pull-indicator .armed {
+  color: var(--accent-soft);
+  font-weight: 600;
+}
+
+/* --- lookalike address comparison ------------------------------------------- */
+.addr-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.addr-compare-label {
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* The two addresses must be directly comparable character by character, which
+   means they cannot be truncated and must line up in the same monospace grid. */
+.addr-compare .mono {
+  word-break: break-all;
+  line-height: 1.35;
+}
+
+.addr-compare-label + .mono {
+  margin-bottom: 4px;
+}

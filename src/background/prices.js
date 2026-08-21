@@ -175,6 +175,73 @@ export async function tokenPrices(chainId, addresses = [], currency) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// NFT collections
+//
+// CoinGecko quotes a collection floor in the chain's native currency and in
+// USD, keyed by contract address on the same platform ids used for tokens.
+// Floors move in hours, not seconds, so this caches far longer than prices do —
+// and the free tier would not tolerate anything else.
+// ---------------------------------------------------------------------------
+const NFT_CACHE_TTL = 10 * 60 * 1000;
+const nftCache = new Map(); // `${chainId}:${contract}` -> { at, data }
+
+/**
+ * Floor price and collection stats for one NFT contract, or null when the
+ * collection is unknown to CoinGecko — which is the common case for anything
+ * small, new, or not on a major chain. Null means "no data", never "zero".
+ */
+export async function collectionFloor(chainId, contractAddress, { force = false } = {}) {
+  const platform = PLATFORM_IDS[chainId];
+  if (!platform || !contractAddress) return null;
+
+  const key = `${chainId}:${String(contractAddress).toLowerCase()}`;
+  const cached = nftCache.get(key);
+  if (!force && cached && Date.now() - cached.at < NFT_CACHE_TTL) return cached.data;
+
+  try {
+    const json = await getJson(`${API}/nfts/${platform}/contract/${contractAddress.toLowerCase()}`);
+    const data = {
+      name: typeof json?.name === 'string' ? json.name.slice(0, 80) : null,
+      symbol: typeof json?.symbol === 'string' ? json.symbol.slice(0, 20) : null,
+      floorNative: numberOrNull(json?.floor_price?.native_currency),
+      floorUsd: numberOrNull(json?.floor_price?.usd),
+      nativeSymbol:
+        typeof json?.native_currency_symbol === 'string' ? json.native_currency_symbol.toUpperCase() : null,
+      volume24hNative: numberOrNull(json?.volume_24h?.native_currency),
+      marketCapNative: numberOrNull(json?.market_cap?.native_currency),
+      floorChange24h: numberOrNull(json?.floor_price_24h_percentage_change?.usd),
+      totalSupply: numberOrNull(json?.total_supply),
+      owners: numberOrNull(json?.number_of_unique_addresses),
+      source: 'CoinGecko',
+      fetchedAt: Date.now(),
+    };
+    nftCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch {
+    // A 404 means CoinGecko does not index this collection, which is a real
+    // answer worth caching — otherwise every refresh re-asks for a collection
+    // that will never be there. Serve any previous hit rather than blanking.
+    const data = cached?.data ?? null;
+    nftCache.set(key, { at: Date.now(), data });
+    return data;
+  }
+}
+
+/** Cache-only read. Lets a list show floors it already knows without any network call. */
+export function peekCollectionFloor(chainId, contractAddress) {
+  if (!contractAddress) return null;
+  return nftCache.get(`${chainId}:${String(contractAddress).toLowerCase()}`)?.data ?? null;
+}
+
+function numberOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+export function clearNftCache() {
+  nftCache.clear();
+}
+
 /** Multiplies a formatted token amount by its unit price. */
 export function fiatValue(amount, price) {
   if (price == null) return null;

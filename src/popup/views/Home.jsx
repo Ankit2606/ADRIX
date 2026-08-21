@@ -1,6 +1,25 @@
-import { useEffect, useState } from 'react';
-import { call, shorten, trimAmount, timeAgo, formatFiat } from '../../lib/ui.js';
-import { TopBar, Avatar, Skeleton, SkeletonRows, EmptyState } from '../components/common.jsx';
+import { useEffect, useRef, useState } from 'react';
+import {
+  call,
+  shorten,
+  trimAmount,
+  timeAgo,
+  formatFiat,
+  formatEta,
+  useAsyncAction,
+  useAutoRefresh,
+  usePullToRefresh,
+} from '../../lib/ui.js';
+import {
+  TopBar,
+  Avatar,
+  Skeleton,
+  SkeletonRows,
+  EmptyState,
+  GasPresetGrid,
+  NonceGapWarning,
+  UnderpricedWarning,
+} from '../components/common.jsx';
 import TransactionDetail from './TransactionDetail.jsx';
 import NftDetail from './NftDetail.jsx';
 import SendNft from './SendNft.jsx';
@@ -13,21 +32,26 @@ const TABS = [
   { key: 'activity', label: 'Activity' },
 ];
 
-export default function Home({ state, go, refresh }) {
+export default function Home({ state, go, refresh, params }) {
   const [portfolio, setPortfolio] = useState(null);
   const [portfolios, setPortfolios] = useState(null);
-  const [tab, setTab] = useState('tokens');
+  // A search result can land here pointing at a specific tab or transaction,
+  // so the initial state comes from the route rather than always being 'tokens'.
+  const [tab, setTab] = useState(params?.tab ?? 'tokens');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [hideBalance, setHideBalance] = useState(false);
   const [bannerDismissed, setBannerDismissed] = useState(false);
-  const [detailHash, setDetailHash] = useState(null);
+  const [detailHash, setDetailHash] = useState(params?.hash ?? null);
   const [detailNft, setDetailNft] = useState(null);
   const [sendingNft, setSendingNft] = useState(null);
   const [contacts, setContacts] = useState([]);
 
   const currency = portfolio?.currency ?? state.currency ?? 'usd';
   const pending = portfolio?.pending ?? 0;
+  // A missing nonce freezes the whole queue, so it changes what the pending
+  // banner means: not "waiting", but "waiting forever until this is fixed".
+  const blockedByGap = (portfolio?.nonce?.gaps?.length ?? 0) > 0;
 
   const load = async () => {
     try {
@@ -36,10 +60,21 @@ export default function Home({ state, go, refresh }) {
       setError('');
     } catch (err) {
       setError(err.message);
+      // Rethrown so the poller can see the failure and back off; the message is
+      // already on screen either way.
+      throw err;
     } finally {
       setLoading(false);
     }
   };
+
+  const { refresh: refreshNow, refreshing, lastAt, failures } = useAutoRefresh(load, {
+    interval: 15000,
+    deps: [state.selected, state.chainId, state.currency],
+  });
+
+  const scrollRef = useRef(null);
+  const { pull, armed } = usePullToRefresh(scrollRef, refreshNow);
 
   // The all-accounts view fans out across every account × every chain, so it is
   // only fetched when that tab is actually open.
@@ -53,9 +88,7 @@ export default function Home({ state, go, refresh }) {
 
   useEffect(() => {
     setLoading(true);
-    load();
-    const timer = setInterval(load, 15000);
-    return () => clearInterval(timer);
+    load().catch(() => {});
   }, [state.selected, state.chainId, state.currency]);
 
   useEffect(() => {
@@ -85,6 +118,7 @@ export default function Home({ state, go, refresh }) {
       <NftDetail
         nft={detailNft}
         explorer={portfolio?.network?.explorer}
+        currency={currency}
         onBack={() => setDetailNft(null)}
         onChanged={load}
         onSend={(nft) => {
@@ -115,10 +149,19 @@ export default function Home({ state, go, refresh }) {
         pending={pending}
         onOpenAccounts={() => go('accounts')}
         onOpenNetworks={() => go('networks')}
+        onOpenSearch={() => go('search')}
         onOpenSettings={() => go('settings')}
       />
 
-      <div className="scroll" style={{ padding: 0 }}>
+      <div className="scroll" style={{ padding: 0 }} ref={scrollRef}>
+        {/* The pull sheet only exists while a gesture is in progress, so it
+            never occupies layout on a machine without a touchscreen. */}
+        {pull > 0 && (
+          <div className="pull-indicator" style={{ height: pull }} aria-hidden="true">
+            <span className={armed ? 'armed' : ''}>{armed ? 'Release to refresh' : 'Pull to refresh'}</span>
+          </div>
+        )}
+
         <div className="hero">
           <div className="hero-amount">
             {loading && !portfolio ? (
@@ -152,6 +195,30 @@ export default function Home({ state, go, refresh }) {
             <button className="link accent" onClick={() => setTab('portfolio')}>
               All accounts ↗
             </button>
+          </div>
+
+          <div className="hero-refresh">
+            <button
+              className="icon-btn plain"
+              style={{ width: 24, height: 24, fontSize: 13 }}
+              onClick={refreshNow}
+              disabled={refreshing}
+              aria-label="Refresh balances"
+              title="Refresh balances"
+            >
+              <span className={refreshing ? 'spin' : ''}>⟳</span>
+            </button>
+            <span className="small faint" aria-live="polite">
+              {refreshing
+                ? 'Refreshing…'
+                : failures > 0
+                  ? // Silently stale is the failure mode worth avoiding: the
+                    // number on screen looks live and is not.
+                    `Could not refresh — showing the last known values${lastAt ? ` from ${timeAgo(lastAt)}` : ''}`
+                  : lastAt
+                    ? `Updated ${timeAgo(lastAt)}`
+                    : ''}
+            </span>
           </div>
         </div>
 
@@ -201,13 +268,26 @@ export default function Home({ state, go, refresh }) {
         )}
 
         {pending > 0 && (
-          <button className="banner pending-banner" onClick={() => setTab('activity')}>
-            <span className="spinner" aria-hidden="true" />
+          <button
+            className={`banner ${blockedByGap ? 'danger' : 'pending-banner'}`}
+            onClick={() => setTab('activity')}
+          >
+            {blockedByGap ? (
+              <span className="banner-icon" aria-hidden="true">
+                ⚠
+              </span>
+            ) : (
+              <span className="spinner" aria-hidden="true" />
+            )}
             <div className="banner-main">
               <div className="banner-title">
                 {pending} transaction{pending === 1 ? '' : 's'} pending
               </div>
-              <div className="banner-sub">Waiting for a block — tap to open the queue</div>
+              <div className="banner-sub">
+                {blockedByGap
+                  ? `Blocked — nonce ${portfolio.nonce.firstGap} is missing and nothing behind it can confirm`
+                  : 'Waiting for a block — tap to open the queue'}
+              </div>
             </div>
             <span className="caret" aria-hidden="true">
               ›
@@ -251,6 +331,7 @@ export default function Home({ state, go, refresh }) {
               loading={loading}
               onChange={load}
               onOpen={setDetailHash}
+              nonceInfo={portfolio?.nonce}
             />
           )}
         </div>
@@ -264,6 +345,7 @@ function Tokens({ portfolio, loading, currency, go, onChange }) {
   const [query, setQuery] = useState('');
   const [showSpam, setShowSpam] = useState(false);
   const [hiding, setHiding] = useState(false);
+  const [managing, setManaging] = useState(null);
   const needle = query.trim().toLowerCase();
   const tokens = (portfolio?.tokens ?? []).filter(
     (token) =>
@@ -346,34 +428,37 @@ function Tokens({ portfolio, loading, currency, go, onChange }) {
           </div>
 
           {shown.map((token) => (
-            <div className={`asset-row ${token.spam?.likelySpam ? 'flagged' : ''}`} key={token.address}>
-              <span className="token-icon">{token.symbol?.charAt(0) ?? '?'}</span>
-              <div className="asset-main">
-                <div className="asset-name">
-                  {token.symbol}
-                  {token.spam?.likelySpam && <span className="badge failed" style={{ marginLeft: 6 }}>spam?</span>}
-                </div>
-                <div className="asset-sub">{token.name || shorten(token.address)}</div>
-                {token.spam?.likelySpam && (
-                  <div className="small" style={{ color: 'var(--danger)' }}>
-                    {token.spam.reasons[0]}
-                    <button
-                      className="link"
-                      style={{ marginLeft: 6 }}
-                      onClick={async () => {
-                        await call('HIDE_TOKEN', { address: token.address });
-                        onChange();
-                      }}
-                    >
-                      hide
-                    </button>
+            <div key={token.address}>
+              <div className={`asset-row ${token.spam?.likelySpam ? 'flagged' : ''}`}>
+                <span className="token-icon">{token.symbol?.charAt(0) ?? '?'}</span>
+                <div className="asset-main">
+                  <div className="asset-name">
+                    {token.symbol}
+                    {token.spam?.likelySpam && <span className="badge failed" style={{ marginLeft: 6 }}>spam?</span>}
+                    {token.edited && <span className="badge" style={{ marginLeft: 6 }}>edited</span>}
                   </div>
-                )}
+                  <div className="asset-sub">{token.name || shorten(token.address)}</div>
+                  {token.spam?.likelySpam && (
+                    <div className="small" style={{ color: 'var(--danger)' }}>
+                      {token.spam.reasons[0]}
+                    </div>
+                  )}
+                  <button
+                    className="link"
+                    onClick={() => setManaging(managing === token.address ? null : token.address)}
+                    aria-expanded={managing === token.address}
+                  >
+                    {managing === token.address ? 'close' : 'manage'}
+                  </button>
+                </div>
+                <div className="asset-values">
+                  <div className="asset-amount">{token.error ? '--' : trimAmount(token.balance)}</div>
+                  <div className="asset-fiat">{formatFiat(token.fiat, currency, { placeholder: 'No rate' })}</div>
+                </div>
               </div>
-              <div className="asset-values">
-                <div className="asset-amount">{token.error ? '--' : trimAmount(token.balance)}</div>
-                <div className="asset-fiat">{formatFiat(token.fiat, currency, { placeholder: 'No rate' })}</div>
-              </div>
+              {managing === token.address && (
+                <ManageToken token={token} onDone={onChange} onClose={() => setManaging(null)} />
+              )}
             </div>
           ))}
         </div>
@@ -424,6 +509,147 @@ function Tokens({ portfolio, loading, currency, go, onChange }) {
         <button className="ghost" onClick={() => go('addToken')}>
           Add token
         </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Correcting a tracked token.
+ *
+ * Decimals are the field that matters. Every amount the user types is scaled by
+ * them before it is sent, so a wrong value does not just display a wrong
+ * balance — it moves the wrong quantity. Reading the contract again is offered
+ * first, and a manual override has to be confirmed against what the chain says.
+ */
+function ManageToken({ token, onDone, onClose }) {
+  const [symbol, setSymbol] = useState(token.symbol ?? '');
+  const [name, setName] = useState(token.name ?? '');
+  const [decimals, setDecimals] = useState(String(token.decimals ?? 18));
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [note, setNote] = useState('');
+  const { busy, error, run } = useAsyncAction();
+
+  const decimalsChanged = Number(decimals) !== Number(token.decimals);
+  const dirty = decimalsChanged || symbol !== token.symbol || name !== (token.name ?? '');
+
+  const save = () =>
+    run(async () => {
+      await call('EDIT_TOKEN', { address: token.address, patch: { symbol, name, decimals: Number(decimals) } });
+      setNote('Saved.');
+      await onDone();
+    });
+
+  const refresh = () =>
+    run(async () => {
+      const result = await call('REFRESH_TOKEN_METADATA', { address: token.address });
+      setSymbol(result.symbol);
+      setName(result.name ?? '');
+      setDecimals(String(result.decimals));
+      setNote(
+        result.changed
+          ? `Re-read from the contract: ${result.previous.symbol} / ${result.previous.decimals} decimals → ${result.symbol} / ${result.decimals}.`
+          : 'The contract reports the same values already stored.'
+      );
+      await onDone();
+    });
+
+  return (
+    <div className="site-panel stack-sm">
+      <div className="between">
+        <span className="eyebrow">Edit {token.symbol}</span>
+        <button className="link" onClick={onClose}>
+          close
+        </button>
+      </div>
+
+      <div className="data-block">{token.address}</div>
+
+      <div className="row2">
+        <label className="field">
+          <span>Symbol</span>
+          <input className="mono" value={symbol} onChange={(e) => setSymbol(e.target.value)} maxLength={24} />
+        </label>
+        <label className="field">
+          <span>Decimals</span>
+          <input
+            className="mono"
+            inputMode="numeric"
+            value={decimals}
+            onChange={(e) => setDecimals(e.target.value.replace(/[^\d]/g, ''))}
+            aria-invalid={decimalsChanged}
+          />
+        </label>
+      </div>
+      <label className="field">
+        <span>Name</span>
+        <input value={name} onChange={(e) => setName(e.target.value)} maxLength={60} />
+      </label>
+
+      {decimalsChanged && (
+        <div className="notice danger">
+          Changing decimals from {token.decimals} to {decimals || '?'} rescales every amount for this token by a factor
+          of 10<sup>{Math.abs(Number(decimals || 0) - Number(token.decimals))}</sup>. Only do this if the contract
+          genuinely misreports its decimals — otherwise your next send will move the wrong quantity.
+        </div>
+      )}
+
+      {note && <div className="ok">{note}</div>}
+      {error && <div className="error" role="alert">{error}</div>}
+
+      <div className="row2">
+        <button className="ghost" onClick={refresh} disabled={busy}>
+          {busy ? 'Reading…' : 'Re-read from chain'}
+        </button>
+        <button className="primary" onClick={save} disabled={busy || !dirty || !symbol.trim()}>
+          Save
+        </button>
+      </div>
+
+      {confirmRemove ? (
+        <div className="stack-sm">
+          <div className="notice">
+            Removing only stops ADRIX tracking this token. Your balance is on chain and is unaffected — re-add the
+            contract any time.
+          </div>
+          <div className="row2">
+            <button className="ghost" onClick={() => setConfirmRemove(false)}>
+              Keep it
+            </button>
+            <button
+              className="danger"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  await call('REMOVE_TOKEN', { address: token.address });
+                  await onDone();
+                  onClose();
+                })
+              }
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="row2">
+          <button
+            className="ghost"
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                await call('HIDE_TOKEN', { address: token.address });
+                await onDone();
+                onClose();
+              })
+            }
+          >
+            Hide
+          </button>
+          <button className="danger" onClick={() => setConfirmRemove(true)}>
+            Stop tracking
+          </button>
+        </div>
       )}
     </div>
   );
@@ -609,6 +835,81 @@ function ApprovalsTab({ portfolio, loading, onChange }) {
   );
 }
 
+/**
+ * Priced confirmation for filling a nonce gap.
+ *
+ * Spelled out rather than labelled "fix": the user is about to pay gas to send
+ * an empty transaction to themselves, which is a strange enough thing to do
+ * that it needs explaining before, not after.
+ */
+function NonceFillReview({ quote, busy, error, onCancel, onConfirm }) {
+  const [preset, setPreset] = useState('market');
+  const option = quote.gasInfo.options[preset];
+
+  return (
+    <div className="stack">
+      <div className="card accent">
+        <div className="eyebrow accent-text">Unblock the queue</div>
+        <p className="small">{quote.effect}</p>
+        <div className="kv">
+          <span className="kv-key">Missing nonce</span>
+          <span className="kv-value mono">{quote.nonce}</span>
+        </div>
+        <div className="kv">
+          <span className="kv-key">Sends</span>
+          <span className="kv-value">0 to your own address</span>
+        </div>
+        <div className="kv">
+          <span className="kv-key">Unblocks</span>
+          <span className="kv-value">
+            {quote.blocked.length} transaction{quote.blocked.length === 1 ? '' : 's'}
+          </span>
+        </div>
+      </div>
+
+      {quote.blocked.length > 0 && (
+        <div className="card">
+          <span className="eyebrow">Waiting on this</span>
+          {quote.blocked.map((tx) => (
+            <div className="kv" key={tx.hash}>
+              <span className="kv-key">nonce {tx.nonce}</span>
+              <span className="kv-value">{tx.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="stack-sm">
+        <h3>Network fee</h3>
+        <GasPresetGrid gasInfo={quote.gasInfo} preset={preset} onSelect={setPreset} />
+        <div className="between small faint">
+          <span>Costs about</span>
+          <span className="mono">
+            {trimAmount(option.likelyFee ?? option.estimatedFee, 6)} {quote.gasInfo.symbol}
+            {option.etaSeconds != null ? ` · ~${formatEta(option.etaSeconds)}` : ''}
+          </span>
+        </div>
+      </div>
+
+      <div className="notice">
+        Pick a fee at least as high as the transactions behind it, or this one queues up behind the same congestion
+        that stalled them.
+      </div>
+
+      {error && <div className="error" role="alert">{error}</div>}
+
+      <div className="row2">
+        <button className="ghost" onClick={onCancel} disabled={busy}>
+          Cancel
+        </button>
+        <button className="primary" onClick={() => onConfirm(preset)} disabled={busy}>
+          {busy ? 'Sending…' : `Fill nonce ${quote.nonce}`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Priced confirmation for a revoke, shown before anything is broadcast. */
 function RevokeReview({ quote, busy, error, onCancel, onConfirm }) {
   const [preset, setPreset] = useState('market');
@@ -636,28 +937,12 @@ function RevokeReview({ quote, busy, error, onCancel, onConfirm }) {
 
       <div className="stack-sm">
         <h3>Network fee</h3>
-        <div className="gas-grid">
-          {['low', 'market', 'fast'].map((key) => (
-            <button
-              key={key}
-              className="gas-option"
-              aria-pressed={preset === key}
-              onClick={() => setPreset(key)}
-            >
-              <b>{key === 'low' ? 'Slow' : key === 'market' ? 'Market' : 'Fast'}</b>
-              <span>~{trimAmount(gasInfo.options[key].likelyFee ?? gasInfo.options[key].estimatedFee, 6)}</span>
-              {gasInfo.options[key].etaSeconds && (
-                <span className="eta">
-                  ~{gasInfo.options[key].etaSeconds < 60 ? `${gasInfo.options[key].etaSeconds}s` : `${Math.round(gasInfo.options[key].etaSeconds / 60)} min`}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
+        <GasPresetGrid gasInfo={gasInfo} preset={preset} onSelect={setPreset} />
         <div className="between small faint">
           <span>Costs about</span>
           <span className="mono">
             {trimAmount(option.likelyFee ?? option.estimatedFee, 6)} {gasInfo.symbol}
+            {option.etaSeconds != null ? ` · ~${formatEta(option.etaSeconds)}` : ''}
           </span>
         </div>
       </div>
@@ -747,6 +1032,13 @@ function Nfts({ portfolio, loading, go, onChange, onOpen }) {
                 <div className="item-sub">
                   #{nft.tokenId} · {nft.balance == null ? '--' : `${nft.balance} owned`}
                 </div>
+                {/* Cache-only: appears once the detail screen has looked this
+                    collection up, rather than firing a lookup per tile. */}
+                {nft.collection?.floorNative != null && (
+                  <div className="item-sub">
+                    floor {trimAmount(nft.collection.floorNative, 4)} {nft.collection.nativeSymbol ?? ''}
+                  </div>
+                )}
                 <div className="between">
                   <span className={`badge ${nft.spam?.likelySpam ? 'failed' : ''}`}>
                     {nft.spam?.likelySpam ? 'spam?' : nft.standard}
@@ -902,7 +1194,7 @@ function PortfolioRow({ account, currency, selected }) {
 }
 
 // ---------------------------------------------------------------------------
-function Activity({ portfolio, loading, onChange, onOpen }) {
+function Activity({ portfolio, loading, onChange, onOpen, nonceInfo }) {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [status, setStatus] = useState('all');
@@ -910,10 +1202,35 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
   const [range, setRange] = useState('all');
   const [query, setQuery] = useState('');
   const [tagFilter, setTagFilter] = useState('');
+  const [gapQuote, setGapQuote] = useState(null);
+  // Activity is scoped to one chain by design — the same symbol, nonce, and
+  // even the same contract address mean different things on different networks.
+  // This makes that scope visible and steppable rather than merely true.
+  const [scope, setScope] = useState('current');
+  const [allActivity, setAllActivity] = useState(null);
+  const [chainSummary, setChainSummary] = useState([]);
+  const [showNoise, setShowNoise] = useState(false);
+
+  useEffect(() => {
+    call('ACTIVITY_BY_CHAIN', {})
+      .then((result) => setChainSummary(result.chains ?? []))
+      .catch(() => setChainSummary([]));
+  }, [portfolio?.address, portfolio?.activity?.length]);
+
+  useEffect(() => {
+    if (scope !== 'all') return;
+    call('LIST_ALL_ACTIVITY', {})
+      .then(setAllActivity)
+      .catch(() => setAllActivity(null));
+  }, [scope, portfolio?.activity?.length]);
 
   if (loading && !portfolio) return <SkeletonRows count={4} />;
 
-  const activity = portfolio?.activity ?? [];
+  const activity = (scope === 'all' ? allActivity : portfolio?.activity) ?? [];
+  const currentChainId = portfolio?.chainId;
+  const elsewhere = chainSummary
+    .filter((chain) => chain.chainId !== currentChainId)
+    .reduce((sum, chain) => sum + chain.total, 0);
   const pending = activity.filter((tx) => tx.status === 'pending').sort((a, b) => a.nonce - b.nonce);
 
   const cutoff =
@@ -932,7 +1249,13 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
   }
   const tags = [...tagCounts.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
 
+  const noiseCount = activity.filter((tx) => tx.noise?.noise).length;
+
   const filtered = activity.filter((tx) => {
+    // Zero-value self-sends the wallet generated itself — cancels and nonce
+    // fills — are real transactions that cost a fee, so they are folded away
+    // rather than dropped.
+    if (!showNoise && tx.noise?.noise) return false;
     if (status !== 'all' && tx.status !== status) return false;
     if (kind !== 'all' && txKind(tx) !== kind) return false;
     if (tagFilter && !(tx.tags ?? []).some((tag) => tag.toLowerCase() === tagFilter.toLowerCase())) return false;
@@ -946,11 +1269,28 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
 
   if (!activity.length) {
     return (
-      <EmptyState
-        icon="↗"
-        title="No activity yet"
-        body="Transactions you send from ADRIX show up here. Incoming transfers need an indexer, which this wallet does not have."
-      />
+      <div className="stack">
+        <EmptyState
+          icon="↗"
+          title={elsewhere > 0 ? `Nothing on ${portfolio?.network?.name ?? 'this network'}` : 'No activity yet'}
+          body={
+            elsewhere > 0
+              ? // The most confusing thing a per-chain history can do is look
+                // empty while the transaction the user remembers sits on
+                // another network. Say where it is.
+                `You have ${elsewhere} transaction${elsewhere === 1 ? '' : 's'} on other networks. Activity is kept per network because a nonce, a symbol, and even a contract address mean different things on each.`
+              : 'Transactions you send from ADRIX show up here. Incoming transfers need an indexer, which this wallet does not have.'
+          }
+          action={
+            elsewhere > 0 ? (
+              <button className="ghost" onClick={() => setScope('all')}>
+                Show every network
+              </button>
+            ) : null
+          }
+        />
+        {elsewhere > 0 && <ChainBreakdown chains={chainSummary} currentChainId={currentChainId} />}
+      </div>
     );
   }
 
@@ -967,8 +1307,55 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
     }
   };
 
+  // Filling a gap costs real gas, so it is priced and confirmed like any other
+  // send rather than fired off by one click on a warning banner.
+  const openGapQuote = async (nonce) => {
+    setBusy('gap');
+    setError('');
+    try {
+      setGapQuote(await call('QUOTE_NONCE_FILL', { nonce }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const confirmGapFill = async (presetKey) => {
+    setBusy('gap');
+    setError('');
+    try {
+      await call('FILL_NONCE_GAP', {
+        nonce: gapQuote.nonce,
+        fees: gapQuote.gasInfo.options[presetKey],
+        gas: gapQuote.gasInfo.gasLimit,
+      });
+      setGapQuote(null);
+      await onChange();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  if (gapQuote) {
+    return (
+      <NonceFillReview
+        quote={gapQuote}
+        busy={busy === 'gap'}
+        error={error}
+        onCancel={() => setGapQuote(null)}
+        onConfirm={confirmGapFill}
+      />
+    );
+  }
+
   return (
     <div className="stack">
+      <NonceGapWarning info={nonceInfo} onFill={openGapQuote} busy={busy === 'gap'} />
+      <UnderpricedWarning info={nonceInfo} onSpeedUp={(hash) => act('SPEED_UP', hash)} busy={Boolean(busy)} />
+
       {pending.length > 0 && (
         <div className="card accent">
           <div className="between">
@@ -980,7 +1367,10 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
           </p>
           <div className="list">
             {pending.map((tx, index) => (
-              <div className="item static compact" key={tx.hash}>
+              <div
+                className={`item static compact ${nonceInfo?.firstGap != null && tx.nonce > nonceInfo.firstGap ? 'blocked' : ''}`}
+                key={tx.hash}
+              >
                 <span className="queue-index" aria-hidden="true">
                   {index + 1}
                 </span>
@@ -989,6 +1379,11 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
                   <span className="item-sub">
                     nonce {tx.nonce} · {timeAgo(tx.submittedAt)}
                   </span>
+                  {nonceInfo?.firstGap != null && tx.nonce > nonceInfo.firstGap && (
+                    <span className="item-sub" style={{ color: 'var(--danger)' }}>
+                      waiting on nonce {nonceInfo.firstGap}
+                    </span>
+                  )}
                 </div>
                 <div className="item-right">
                   <button className="link accent" disabled={busy === tx.hash} onClick={() => act('SPEED_UP', tx.hash)}>
@@ -1005,6 +1400,22 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
       )}
 
       <div className="card activity-tools">
+        <div className="tabs" role="tablist" aria-label="Activity scope">
+          <button role="tab" aria-selected={scope === 'current'} onClick={() => setScope('current')}>
+            {portfolio?.network?.name ?? 'This network'}
+          </button>
+          <button role="tab" aria-selected={scope === 'all'} onClick={() => setScope('all')}>
+            All networks{elsewhere > 0 ? ` (+${elsewhere})` : ''}
+          </button>
+        </div>
+
+        {scope === 'all' && (
+          <p className="small faint">
+            Showing every network. Amounts and nonces are only comparable within a single chain, so each row is
+            labelled with the network it belongs to.
+          </p>
+        )}
+
         <label className="field">
           <span>Search activity</span>
           <input
@@ -1063,6 +1474,18 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
           </div>
         )}
 
+        {noiseCount > 0 && (
+          <label className="check-line">
+            <input type="checkbox" checked={showNoise} onChange={(e) => setShowNoise(e.target.checked)} />
+            <span className="item-main">
+              <span>Show {noiseCount} zero-value transfer{noiseCount === 1 ? '' : 's'}</span>
+              <span className="small faint">
+                Cancels and nonce fills the wallet sent itself. They cost a fee but move nothing.
+              </span>
+            </span>
+          </label>
+        )}
+
         <div className="between small">
           <span>
             Showing {filtered.length} of {activity.length}
@@ -1091,6 +1514,10 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
 
       {error && <div className="error" role="alert">{error}</div>}
 
+      {scope === 'current' && elsewhere > 0 && (
+        <ChainBreakdown chains={chainSummary} currentChainId={currentChainId} onShowAll={() => setScope('all')} />
+      )}
+
       {!filtered.length ? (
         <EmptyState icon="⌕" title="No match" body="No transaction matches those filters." />
       ) : (
@@ -1104,7 +1531,9 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
                 <span className="item-sub">
                   {tx.decoded?.name ? `${tx.decoded.name} · ` : ''}
                   {tx.to ? shorten(tx.to) : 'contract deploy'} · {timeAgo(tx.submittedAt)}
+                  {scope === 'all' && ` · ${tx.networkName ?? tx.chainId}`}
                 </span>
+                {tx.noise?.noise && <span className="small faint">{tx.noise.reason}</span>}
                 {tx.note && <span className="small faint">{tx.note}</span>}
                 {tx.tags?.length > 0 && (
                   <span className="inline wrap" style={{ marginTop: 4 }}>
@@ -1143,6 +1572,38 @@ function Activity({ portfolio, loading, onChange, onOpen }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Where an account's history actually lives, network by network. */
+function ChainBreakdown({ chains, currentChainId, onShowAll }) {
+  if (!chains.length) return null;
+
+  return (
+    <div className="card">
+      <div className="between">
+        <span className="eyebrow">History by network</span>
+        {onShowAll && (
+          <button className="link accent" onClick={onShowAll}>
+            show all
+          </button>
+        )}
+      </div>
+      {chains.map((chain) => (
+        <div className="kv" key={chain.chainId}>
+          <span className="kv-key">
+            {chain.networkName}
+            {chain.chainId === currentChainId && <span className="badge confirmed" style={{ marginLeft: 6 }}>current</span>}
+          </span>
+          <span className="kv-value">
+            {chain.total} tx
+            {chain.pending > 0 && ` · ${chain.pending} pending`}
+            {chain.failed > 0 && ` · ${chain.failed} failed`}
+            {chain.lastAt ? ` · ${timeAgo(chain.lastAt)}` : ''}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }

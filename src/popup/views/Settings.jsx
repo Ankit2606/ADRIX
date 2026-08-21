@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { call, shorten, timeAgo, useAsyncAction } from '../../lib/ui.js';
+import { call, shorten, timeAgo, formatDateTime, useAsyncAction } from '../../lib/ui.js';
 import { LOCALES, localeCoverage } from '../../lib/i18n.js';
 import { BackBar, PasswordPrompt, Avatar } from '../components/common.jsx';
 
@@ -177,6 +177,8 @@ export default function Settings({ state, go, refresh }) {
           refresh={refresh}
         />
 
+        <SignatureLog refresh={refresh} />
+
         <DappHistory
           history={state.connectionHistory ?? []}
           networks={state.allNetworks ?? state.networks}
@@ -185,6 +187,8 @@ export default function Settings({ state, go, refresh }) {
         />
 
         <AddressBook contacts={state.contacts ?? []} refresh={refresh} />
+
+        <EncryptedBackup refresh={refresh} />
 
         <section className="card">
           <h2>Not implemented yet</h2>
@@ -1171,6 +1175,591 @@ function ConnectedSite({ site, accounts, networks, currentChainId, open, onToggl
               Save
             </button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * Encrypted backup of everything the recovery phrase cannot restore.
+ *
+ * Restoring a wallet from its phrase brings back the accounts and nothing else:
+ * no contact names, no custom networks, no tracked tokens, no transaction
+ * notes. This is the file that brings those back — and deliberately holds no
+ * key material, because a phrase in a file is a phrase that can be attacked
+ * offline forever.
+ */
+function EncryptedBackup({ refresh }) {
+  const [mode, setMode] = useState(null); // null | 'export' | 'import'
+  const [sections, setSections] = useState([]);
+  const [chosen, setChosen] = useState({});
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [report, setReport] = useState(null);
+  const fileRef = useRef(null);
+  const { busy, error, setError, run } = useAsyncAction();
+
+  useEffect(() => {
+    call('GET_BACKUP_SECTIONS')
+      .then((result) => {
+        setSections(result.sections);
+        setChosen(Object.fromEntries(result.sections.map((s) => [s.key, !s.sensitive])));
+      })
+      .catch(() => {});
+  }, []);
+
+  const reset = () => {
+    setMode(null);
+    setPassword('');
+    setConfirm('');
+    setFile(null);
+    setPreview(null);
+    setError('');
+  };
+
+  const doExport = () =>
+    run(async () => {
+      if (password.length < 8) throw new Error('Use a backup password of at least 8 characters.');
+      if (password !== confirm) throw new Error('The two passwords do not match.');
+
+      const payload = await call('EXPORT_BACKUP', { password, sections: chosen });
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      );
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `adrix-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      reset();
+      setReport({ exported: true });
+    });
+
+  const doPreview = () =>
+    run(async () => {
+      setPreview(await call('PREVIEW_BACKUP', { password, file }));
+    });
+
+  const doRestore = () =>
+    run(async () => {
+      const result = await call('RESTORE_BACKUP', { password, file, sections: chosen });
+      setReport(result.report);
+      setPreview(null);
+      setMode(null);
+      await refresh();
+    });
+
+  const toggle = (key) => setChosen((current) => ({ ...current, [key]: !current[key] }));
+
+  return (
+    <section className="card">
+      <div className="between">
+        <h2>Encrypted backup</h2>
+        {mode && (
+          <button className="link" onClick={reset}>
+            close
+          </button>
+        )}
+      </div>
+
+      {!mode && (
+        <>
+          <p className="small">
+            Your recovery phrase restores the accounts. It does not restore your address book, account names, custom
+            networks, tracked tokens, or transaction notes — this file does.
+          </p>
+          <div className="notice">
+            <b>No keys are in this file.</b> Not the recovery phrase, not any private key. A phrase written to a file
+            can be copied once and attacked offline forever, at whatever password you chose that day. Keep backing the
+            phrase up on paper.
+          </div>
+          {report?.exported && <div className="ok">Backup downloaded.</div>}
+          {report && !report.exported && <RestoreReport report={report} />}
+          <div className="row2">
+            <button className="ghost" onClick={() => setMode('export')}>
+              Create backup
+            </button>
+            <button className="ghost" onClick={() => setMode('import')}>
+              Restore backup
+            </button>
+          </div>
+        </>
+      )}
+
+      {mode === 'export' && (
+        <div className="stack-sm">
+          <div className="eyebrow">What to include</div>
+          {sections.map((section) => (
+            <label className="check-line" key={section.key}>
+              <input type="checkbox" checked={Boolean(chosen[section.key])} onChange={() => toggle(section.key)} />
+              <span className="item-main">
+                <span>
+                  {section.label}
+                  {section.sensitive && <span className="badge failed" style={{ marginLeft: 6 }}>sensitive</span>}
+                </span>
+                <span className="small faint">{section.hint}</span>
+              </span>
+            </label>
+          ))}
+
+          {chosen.sites && (
+            <div className="notice danger">
+              Site permissions in a backup re-authorise those dApps on restore, without them asking again. Include this
+              only if the backup will never leave your own machine.
+            </div>
+          )}
+
+          <label className="field">
+            <span>Backup password</span>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+            <span className="small faint">
+              Independent of your wallet password. There is no recovery for this one either — if you lose it the file
+              is unreadable.
+            </span>
+          </label>
+          <label className="field">
+            <span>Confirm password</span>
+            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+          </label>
+
+          {error && <div className="error" role="alert">{error}</div>}
+          <button className="primary" onClick={doExport} disabled={busy || password.length < 8}>
+            {busy ? 'Encrypting…' : 'Download backup'}
+          </button>
+        </div>
+      )}
+
+      {mode === 'import' && (
+        <div className="stack-sm">
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            className="visually-hidden"
+            onChange={async (e) => {
+              const chosenFile = e.target.files?.[0];
+              e.target.value = '';
+              if (!chosenFile) return;
+              setPreview(null);
+              setError('');
+              setFile(await chosenFile.text());
+            }}
+          />
+          <button className="ghost" onClick={() => fileRef.current?.click()}>
+            {file ? 'Choose a different file' : 'Choose backup file'}
+          </button>
+
+          {file && !preview && (
+            <>
+              <label className="field">
+                <span>Backup password</span>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && password && doPreview()}
+                  autoComplete="off"
+                />
+              </label>
+              {error && <div className="error" role="alert">{error}</div>}
+              <button className="ghost" onClick={doPreview} disabled={busy || !password}>
+                {busy ? 'Decrypting…' : 'Open backup'}
+              </button>
+            </>
+          )}
+
+          {preview && (
+            <>
+              <div className="card">
+                <div className="between">
+                  <span className="eyebrow">Backup contents</span>
+                  <span className="small faint">
+                    {preview.createdAt ? formatDateTime(preview.createdAt) : 'unknown date'}
+                  </span>
+                </div>
+                {Object.entries(preview.summary)
+                  .filter(([, count]) => count > 0)
+                  .map(([key, count]) => (
+                    <div className="kv" key={key}>
+                      <span className="kv-key">{key}</span>
+                      <span className="kv-value">{count}</span>
+                    </div>
+                  ))}
+                <span className="small faint">Written by ADRIX {preview.appVersion}.</span>
+              </div>
+
+              <div className="eyebrow">What to restore</div>
+              {sections
+                .filter((section) => preview.available[section.key])
+                .map((section) => (
+                  <label className="check-line" key={section.key}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(chosen[section.key])}
+                      onChange={() => toggle(section.key)}
+                    />
+                    <span className="item-main">
+                      <span>{section.label}</span>
+                      <span className="small faint">{section.hint}</span>
+                    </span>
+                  </label>
+                ))}
+
+              <div className="notice">
+                Restoring merges — anything already here wins, so an old backup cannot roll back something newer.
+                Nothing is deleted.
+              </div>
+              {error && <div className="error" role="alert">{error}</div>}
+              <button className="primary" onClick={doRestore} disabled={busy}>
+                {busy ? 'Restoring…' : 'Restore selected'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RestoreReport({ report }) {
+  const lines = [];
+  if (report.contacts) lines.push(`${report.contacts.added} contacts added, ${report.contacts.skipped} already present`);
+  if (report.accountNames) lines.push(`${report.accountNames.renamed} accounts renamed`);
+  if (report.networks) lines.push(`${report.networks.added} networks, ${report.networks.overrides} endpoint overrides`);
+  if (report.tokens) lines.push(`${report.tokens.added} tokens added`);
+  if (report.nfts) lines.push(`${report.nfts.added} NFTs added`);
+  if (report.notes) lines.push(`${report.notes.applied} notes applied`);
+  if (report.settings) lines.push('preferences applied');
+  if (report.sites) lines.push(`${report.sites.added} site permissions restored`);
+
+  return (
+    <div className="ok">
+      Restored: {lines.join(' · ')}.
+      {report.notes?.orphaned > 0 && (
+        <span className="small faint">
+          {' '}
+          {report.notes.orphaned} notes referred to transactions this install has never seen, so they could not be
+          attached.
+        </span>
+      )}
+      {report.tokenLists?.pending?.length > 0 && (
+        <span className="small faint">
+          {' '}
+          {report.tokenLists.pending.length} token list URLs were in the file — re-import them from the Lists tab.
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * What has been signed, for whom, and when.
+ *
+ * A signature is not a transaction: it costs nothing, appears nowhere on chain,
+ * and can be redeemed by someone else weeks later. An off-chain Permit grants
+ * spending rights that never show up in the approvals list, which is exactly
+ * why it is the drainer's preferred instrument. This log is the only place
+ * those are recorded, so it leads with them rather than with raw counts.
+ */
+function SignatureLog({ refresh }) {
+  const [rows, setRows] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [query, setQuery] = useState('');
+  const [kind, setKind] = useState('all');
+  const [expanded, setExpanded] = useState(null);
+  const [showAll, setShowAll] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const { busy, run } = useAsyncAction();
+
+  const load = async () => {
+    const result = await call('LIST_SIGNATURES', {});
+    setRows(result.signatures ?? []);
+    setStats(result.stats ?? null);
+  };
+
+  useEffect(() => {
+    load().catch(() => {});
+  }, []);
+
+  const needle = query.trim().toLowerCase();
+  const filtered = rows.filter((row) => {
+    if (kind !== 'all' && row.risk?.kind !== kind) return false;
+    if (!needle) return true;
+    return [row.origin, row.primaryType, row.domainName, row.message, row.risk?.spender]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(needle));
+  });
+  const visible = showAll ? filtered : filtered.slice(0, 8);
+
+  const exportLog = () => {
+    const header = ['timestamp', 'origin', 'account', 'network', 'type', 'kind', 'summary', 'spender', 'amount', 'signature'];
+    const csv = [
+      header.join(','),
+      ...filtered.map((row) =>
+        [
+          row.at ? new Date(row.at).toISOString() : '',
+          row.origin,
+          row.account,
+          row.networkName ?? row.chainId,
+          row.type,
+          row.risk?.kind ?? '',
+          row.type === 'personal' ? (row.message ?? '').slice(0, 300) : (row.primaryType ?? ''),
+          row.risk?.spender ?? '',
+          row.risk?.amount ?? '',
+          row.signature,
+        ]
+          .map((value) => `"${String(value ?? '').replaceAll('"', '""')}"`)
+          .join(',')
+      ),
+    ].join('\n');
+
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `adrix-signatures-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  return (
+    <section className="card">
+      <div className="between">
+        <h2>Signature log</h2>
+        {rows.length > 0 && (
+          <span className="inline">
+            <button className="link" onClick={exportLog}>
+              export
+            </button>
+            <button className="link" onClick={() => setConfirmClear(!confirmClear)}>
+              {confirmClear ? 'cancel' : 'clear'}
+            </button>
+          </span>
+        )}
+      </div>
+
+      {!rows.length ? (
+        <p className="small">
+          Nothing signed yet. Every message and typed-data payload you sign for a site is recorded here, including
+          Permits — which grant spending rights without ever appearing in the approvals list.
+        </p>
+      ) : (
+        <>
+          {stats?.unlimitedPermits > 0 && (
+            <div className="notice danger">
+              {stats.unlimitedPermits} unlimited Permit signature{stats.unlimitedPermits === 1 ? '' : 's'} in this log.
+              A Permit cannot be revoked from the approvals screen — the only way to invalidate one is to use the
+              token's nonce, usually by making another approval on chain.
+            </div>
+          )}
+
+          <div className="stat-grid">
+            <div className="stat">
+              <span className="stat-value">{stats?.total ?? rows.length}</span>
+              <span className="stat-label">Signatures</span>
+            </div>
+            <div className="stat">
+              <span className={`stat-value ${stats?.permits ? 'danger' : ''}`}>{stats?.permits ?? 0}</span>
+              <span className="stat-label">Permits</span>
+            </div>
+            <div className="stat">
+              <span className="stat-value">{stats?.logins ?? 0}</span>
+              <span className="stat-label">Sign-ins</span>
+            </div>
+            <div className="stat">
+              <span className="stat-value">{stats?.origins ?? 0}</span>
+              <span className="stat-label">Sites</span>
+            </div>
+          </div>
+
+          <div className="row2">
+            <label className="field">
+              <span>Search</span>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Site, type, spender"
+                type="search"
+              />
+            </label>
+            <label className="field">
+              <span>Kind</span>
+              <select value={kind} onChange={(e) => setKind(e.target.value)}>
+                <option value="all">Everything</option>
+                <option value="permit">Permits</option>
+                <option value="order">Marketplace orders</option>
+                <option value="siwe">Sign-ins</option>
+                <option value="message">Plain messages</option>
+                <option value="typed">Other typed data</option>
+              </select>
+            </label>
+          </div>
+
+          {confirmClear && (
+            <div className="stack-sm">
+              <div className="notice">
+                Clearing the log does not invalidate anything you signed. Those signatures still exist and can still be
+                redeemed — this only erases your record of them.
+              </div>
+              <button
+                className="danger"
+                disabled={busy}
+                onClick={() =>
+                  run(async () => {
+                    await call('CLEAR_SIGNATURES');
+                    await load();
+                    await refresh();
+                    setConfirmClear(false);
+                  })
+                }
+              >
+                Clear log
+              </button>
+            </div>
+          )}
+
+          {!filtered.length ? (
+            <p className="small faint">No signature matches that filter.</p>
+          ) : (
+            <div className="list">
+              {visible.map((row) => (
+                <SignatureRow
+                  key={row.id}
+                  row={row}
+                  open={expanded === row.id}
+                  onToggle={() => setExpanded(expanded === row.id ? null : row.id)}
+                />
+              ))}
+            </div>
+          )}
+
+          {filtered.length > 8 && (
+            <button className="link" onClick={() => setShowAll(!showAll)} aria-expanded={showAll}>
+              {showAll ? 'show less' : `show all ${filtered.length}`}
+            </button>
+          )}
+
+          <p className="small faint">
+            The most recent 200 signatures, stored locally and never sent anywhere.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+const SIGNATURE_LABEL = {
+  permit: 'Spending permit',
+  order: 'Marketplace order',
+  siwe: 'Sign-in',
+  delegation: 'Delegation',
+  message: 'Message',
+  typed: 'Typed data',
+};
+
+function SignatureRow({ row, open, onToggle }) {
+  const kind = row.risk?.kind ?? 'message';
+  const flagged = (row.risk?.warnings?.length ?? 0) > 0;
+
+  return (
+    <div className="site-row">
+      <button className="item" onClick={onToggle} aria-expanded={open}>
+        <span
+          className="dot"
+          style={{ background: flagged ? 'var(--danger)' : 'var(--line-strong)', boxShadow: 'none' }}
+        />
+        <div className="item-main">
+          <span className="item-title">
+            {SIGNATURE_LABEL[kind] ?? kind}
+            {row.risk?.unlimited && <span className="badge failed" style={{ marginLeft: 6 }}>unlimited</span>}
+            {row.risk?.originMismatch && <span className="badge failed" style={{ marginLeft: 6 }}>origin mismatch</span>}
+          </span>
+          <span className="item-sub">
+            {row.origin?.replace(/^https?:\/\//, '')} · {timeAgo(row.at)}
+          </span>
+          <span className="item-sub faint">
+            {row.primaryType ? `${row.primaryType} · ` : ''}
+            {row.networkName ?? row.chainId} · {shorten(row.account, 6, 4)}
+          </span>
+        </div>
+        <span className="link">{open ? 'close' : 'view'}</span>
+      </button>
+
+      {open && (
+        <div className="site-panel stack-sm">
+          {row.risk?.warnings?.map((warning) => (
+            <div className="notice danger" key={warning}>
+              {warning}
+            </div>
+          ))}
+
+          {kind === 'permit' && (
+            <>
+              <div className="kv">
+                <span className="kv-key">Spender</span>
+                <span className="kv-value mono">{shorten(row.risk.spender, 10, 8)}</span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Amount</span>
+                <span className="kv-value">{row.risk.unlimited ? 'Unlimited' : `${row.risk.amount} (raw)`}</span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Expires</span>
+                <span className="kv-value">
+                  {row.risk.deadline ? formatDateTime(Number(row.risk.deadline) * 1000) : 'no expiry'}
+                </span>
+              </div>
+            </>
+          )}
+
+          {kind === 'siwe' && row.risk.siwe && (
+            <>
+              <div className="kv">
+                <span className="kv-key">Claimed site</span>
+                <span className="kv-value">{row.risk.siwe.domain ?? '--'}</span>
+              </div>
+              <div className="kv">
+                <span className="kv-key">Expires</span>
+                <span className="kv-value">{row.risk.siwe.expirationTime ?? 'no expiry'}</span>
+              </div>
+            </>
+          )}
+
+          {row.verifyingContract && (
+            <div className="kv">
+              <span className="kv-key">Verifying contract</span>
+              <span className="kv-value mono">{shorten(row.verifyingContract, 10, 8)}</span>
+            </div>
+          )}
+
+          {row.type === 'personal' && row.message && (
+            <>
+              <div className="eyebrow">Message</div>
+              <div className="data-block">{row.message}</div>
+            </>
+          )}
+
+          {row.fields?.length > 0 && (
+            <>
+              <div className="eyebrow">Contents</div>
+              {row.fields.map((field, index) => (
+                <div className="kv" key={`${field.key}-${index}`}>
+                  <span className="kv-key">{field.key}</span>
+                  <span className="kv-value" style={{ maxWidth: '64%' }}>
+                    {field.value}
+                  </span>
+                </div>
+              ))}
+            </>
+          )}
+
+          <div className="eyebrow">Signature</div>
+          <div className="data-block">{row.signature}</div>
+          <span className="small faint">{formatDateTime(row.at)}</span>
         </div>
       )}
     </div>
